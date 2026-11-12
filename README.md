@@ -1,6 +1,6 @@
 # meldown
 
-Patches that give [Meld](https://meld.app/) a PhpStorm-style way of resolving merge conflicts, plus a `git mergetool` wrapper and a dark theme to match.
+Patches that give [Meld](https://meld.app/) a calmer way to resolve merge conflicts, where you apply or dismiss each change and see every conflicted file in one list, plus a `git mergetool` wrapper and a dark theme to match.
 
 Stock Meld opens a three-way merge with the result already half-merged, and every change shows as a copy between panes. meldown keeps Meld but changes how a merge works:
 
@@ -20,7 +20,7 @@ Tested on Ubuntu 24.04 under WSL 2 (WSLg). Other Linux distributions should work
 | `patches/` | The patch series, in `git format-patch` form |
 | `MELD_VERSION` | The Meld release tag the patches apply to |
 | `meldown-merge.sh` | The `git mergetool` wrapper, and the Conflicts tab launcher with `--repo` |
-| `theme/` | A colour scheme matching PhpStorm's Islands Dark, and light gutter icons |
+| `theme/` | A dark colour scheme and light gutter icons |
 | `make-test-repo.sh` | Builds a throwaway repo stuck in a merge, for trying everything out |
 
 ## Setup
@@ -54,11 +54,11 @@ The wrapper looks for Meld in `~/.local/src/meld`; set `MELD_SRC` if you cloned 
 
 ### Theme (optional)
 
-The colour scheme matches PhpStorm's Islands Dark, with IntelliJ's diff colours, and the font is [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) (SIL Open Font License). The gutter icons replace Meld's own black ones, which ignore a dark theme; they go under the Adwaita theme because Meld's bundled copies win over a user hicolor folder. A source checkout counts as a development build, so GTK gives it a striped title bar, which the stylesheet line removes.
+The dark colour scheme takes its editor colours from JetBrains' open-source Islands Dark scheme and its diff colours from Darcula (see `NOTICE`), and the font is [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) (SIL Open Font License). The gutter icons replace Meld's own black ones, which ignore a dark theme; they go under the Adwaita theme because Meld's bundled copies win over a user hicolor folder. A source checkout counts as a development build, so GTK gives it a striped title bar, which the stylesheet line removes.
 
 ```bash
 # colour scheme and gutter icons (copy again after changing them)
-mkdir -p ~/.local/share/gtksourceview-4/styles && cp "${MELDOWN:?}"/theme/intellij-islands-dark.xml ~/.local/share/gtksourceview-4/styles/
+mkdir -p ~/.local/share/gtksourceview-4/styles && cp "${MELDOWN:?}"/theme/meldown-dark.xml ~/.local/share/gtksourceview-4/styles/
 mkdir -p ~/.local/share/icons/Adwaita/16x16/actions && cp "${MELDOWN:?}"/theme/icons/*.png ~/.local/share/icons/Adwaita/16x16/actions/
 # JetBrains Mono
 T=$(mktemp -d) && curl -fsSL -o "$T/jbm.zip" https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip
@@ -67,7 +67,7 @@ mkdir -p ~/.local/share/fonts && unzip -q -o -j "$T/jbm.zip" 'fonts/ttf/JetBrain
 mkdir -p ~/.config/gtk-3.0 && printf '%s\n' '.devel headerbar { background-image: none; }' >> ~/.config/gtk-3.0/gtk.css
 # Meld settings, through the checkout's own schema
 export GSETTINGS_SCHEMA_DIR=$HOME/.local/src/meld/data
-gsettings set org.gnome.meld style-scheme intellij-islands-dark
+gsettings set org.gnome.meld style-scheme meldown-dark
 gsettings set org.gnome.meld custom-font 'JetBrains Mono 10'
 gsettings set org.gnome.meld use-system-font false
 gsettings set org.gnome.meld wrap-mode none

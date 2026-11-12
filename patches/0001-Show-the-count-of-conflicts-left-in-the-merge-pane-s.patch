@@ -1,4 +1,4 @@
-From 78ab80e0c2c3b9157e2674eedfd8875a034b0e97 Mon Sep 17 00:00:00 2001
+From c8bb9777e01b8f1a976f958dab95dff3c2c4fee3 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Wed, 11 Nov 2026 19:40:32 +0200
 Subject: [PATCH 1/6] Show the count of conflicts left in the merge pane's

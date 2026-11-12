@@ -1,7 +1,7 @@
-From 55735d86fdbe299b79b55ae880b0d410470c26d9 Mon Sep 17 00:00:00 2001
+From 06345008bf5ccebbdb7b498c8e539b0e58c8e98c Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 00:42:00 +0200
-Subject: [PATCH 4/6] Add the PhpStorm-style merge view (--anchored-merge)
+Subject: [PATCH 4/6] Add an apply-or-dismiss merge view (--anchored-merge)
 
 A three-way merge opened with --anchored-merge starts the result from the
 base and puts an arrow and an X on every change: the arrow applies that
@@ -196,7 +196,7 @@ index ee18a62..efcbc32 100644
  
 diff --git a/meld/anchoredview.py b/meld/anchoredview.py
 new file mode 100644
-index 0000000..a41ac53
+index 0000000..25d8248
 --- /dev/null
 +++ b/meld/anchoredview.py
 @@ -0,0 +1,400 @@
@@ -218,7 +218,7 @@ index 0000000..a41ac53
 +"""The base-anchored merge view (local patch, not upstream Meld).
 +
 +A three-way FileDiff opened with --anchored-merge gets one of these. It
-+works like PhpStorm's merge window: the result starts as the base, every
++works as an apply-or-dismiss merge: the result starts as the base, every
 +change has an arrow that applies it and an X that dismisses it, a toolbar
 +applies all non-conflicting changes or runs the magic wand, and a counter
 +shows what is left. The state lives in meld/matchers/anchored.py; this
@@ -461,7 +461,7 @@ index 0000000..a41ac53
 +                    continue
 +                apply = (arrow, 'apply', group.index, side)
 +                dismiss = ('delete', 'dismiss', group.index, side)
-+                # The arrow sits next to the result pane, as in PhpStorm.
++                # The arrow sits next to the result pane, where the change would go.
 +                actions = [dismiss, apply] if side == LEFT else [apply, dismiss]
 +                buttons.append((rng[0], actions))
 +            gutter = self.fd.actiongutter[gutter_index]
@@ -601,14 +601,14 @@ index 0000000..a41ac53
 +            target = earlier[-1] if earlier else starts[-1]
 +        self.fd.move_cursor(1, min(target, buf.get_line_count() - 1))
 diff --git a/meld/const.py b/meld/const.py
-index f854281..57f6d9d 100644
+index f854281..67f368d 100644
 --- a/meld/const.py
 +++ b/meld/const.py
 @@ -24,6 +24,8 @@ class ChunkAction(enum.Enum):
  class FileComparisonMode(enum.Enum):
      AutoMerge = 'AutoMerge'
      Compare = 'Compare'
-+    # Local patch: PhpStorm-style merge (meld/anchoredview.py)
++    # Local patch: the apply-or-dismiss merge view (meld/anchoredview.py)
 +    AnchoredMerge = 'AnchoredMerge'
  
  
@@ -972,7 +972,7 @@ index 675b001..4752748 100644
                  # Join this change to the previous one across the
                  # punctuation between them, so one edit reads as one span.
 diff --git a/meld/meldapp.py b/meld/meldapp.py
-index 02f36d5..13faec6 100644
+index 02f36d5..9b22c53 100644
 --- a/meld/meldapp.py
 +++ b/meld/meldapp.py
 @@ -92,6 +92,13 @@ class MeldApp(Gtk.Application):
@@ -993,7 +993,7 @@ index 02f36d5..13faec6 100644
          parser.add_option(
              "--auto-merge", None, action="store_true", default=False,
              help=_("Automatically merge files"))
-+        # Local patch: PhpStorm-style merge view (meld/anchoredview.py).
++        # Local patch: the apply-or-dismiss merge view (meld/anchoredview.py).
 +        parser.add_option(
 +            "--anchored-merge", None, action="store_true", default=False,
 +            help="Merge LOCAL BASE REMOTE change by change, starting from "
@@ -1033,7 +1033,7 @@ index 02f36d5..13faec6 100644
                  )
              except ValueError as err:
 diff --git a/meld/meldwindow.py b/meld/meldwindow.py
-index 52b17ee..d1ab4d8 100644
+index 52b17ee..c6c3484 100644
 --- a/meld/meldwindow.py
 +++ b/meld/meldwindow.py
 @@ -391,13 +391,15 @@ class MeldWindow(Gtk.ApplicationWindow):
@@ -1048,7 +1048,7 @@ index 52b17ee..d1ab4d8 100644
                  [f.get_parse_name() for f in gfiles])
 -        doc = FileDiff(
 -            len(gfiles), comparison_mode=FileComparisonMode.AutoMerge)
-+        # Local patch: anchored selects the PhpStorm-style merge view.
++        # Local patch: anchored selects the apply-or-dismiss merge view.
 +        mode = (FileComparisonMode.AnchoredMerge if anchored
 +                else FileComparisonMode.AutoMerge)
 +        doc = FileDiff(len(gfiles), comparison_mode=mode)

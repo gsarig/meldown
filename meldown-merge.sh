@@ -86,7 +86,7 @@ case "$left_files" in
     *) result_title="Result ($left_files files left): $merged_file" ;;
 esac
 
-# --anchored-merge is the patched checkout's PhpStorm-style merge view: the
+# --anchored-merge is the patched checkout's apply-or-dismiss merge view: the
 # result starts as the base and each change is applied or dismissed.
 exec "$MELD" --anchored-merge \
     -L "$left" -L "$result_title" -L "$right" \

@@ -1,9 +1,9 @@
-From 1bff45a694a7d117aec4d3f70625822890fd260a Mon Sep 17 00:00:00 2001
+From 783b397d81730e72da60e4cda3277db618a6aea4 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 01:24:56 +0200
 Subject: [PATCH 5/6] Add the Conflicts tab (--conflicts DIR)
 
-PhpStorm's Conflicts dialog as a Meld tab: every conflicted file of a git
+A Conflicts tab for Meld: every conflicted file of a git
 repository, grouped Unresolved, Auto-resolved and Resolved, with Yours
 and Theirs status and an Accept button per side (that side's version
 staged, or its deletion for a side that deleted the file).
@@ -31,7 +31,7 @@ _HEADER, set by the wrapper that knows the branch names.
  create mode 100644 test/test_conflicts.py
 
 diff --git a/meld/anchoredview.py b/meld/anchoredview.py
-index a41ac53..be7877d 100644
+index 25d8248..4a1fb66 100644
 --- a/meld/anchoredview.py
 +++ b/meld/anchoredview.py
 @@ -75,6 +75,9 @@ class AnchoredView:
@@ -206,7 +206,7 @@ index 0000000..993fd78
 +    return join_lines(result, newline).encode('utf-8')
 diff --git a/meld/conflictsview.py b/meld/conflictsview.py
 new file mode 100644
-index 0000000..3d5c90b
+index 0000000..89acd3c
 --- /dev/null
 +++ b/meld/conflictsview.py
 @@ -0,0 +1,451 @@
@@ -227,7 +227,7 @@ index 0000000..3d5c90b
 +
 +"""The Conflicts tab (local patch, not upstream Meld).
 +
-+`meld --conflicts DIR` opens this tab, PhpStorm's Conflicts dialog in a
++`meld --conflicts DIR` opens this tab, the repository's conflicts in a
 +Meld tab: every conflicted file of the repo, its Yours and Theirs status
 +with an Accept button each, Resolve all simple conflicts, and Accept and
 +finish. A file opens in the anchored merge view (meld/anchoredview.py) in
@@ -662,7 +662,7 @@ index 0000000..3d5c90b
 +
 +ConflictsView.set_css_name('conflicts-view')
 diff --git a/meld/meldapp.py b/meld/meldapp.py
-index 13faec6..29f3a49 100644
+index 9b22c53..2d00781 100644
 --- a/meld/meldapp.py
 +++ b/meld/meldapp.py
 @@ -286,6 +286,12 @@ class MeldApp(Gtk.Application):
@@ -674,7 +674,7 @@ index 13faec6..29f3a49 100644
 +            "", "--conflicts", action="store", type="string",
 +            dest="conflicts", default=None,
 +            help="List the merge conflicts of the git repository at DIR, "
-+                 "PhpStorm style (local patch)")
++                 "in a Conflicts tab (local patch)")
          parser.add_option(
              "", "--comparison-file", action="store", type="string",
              dest="comparison_file", default=None,
@@ -696,7 +696,7 @@ index 13faec6..29f3a49 100644
                                         args[0].endswith(".meldcmp")):
              path = options.comparison_file or args[0]
 diff --git a/meld/meldwindow.py b/meld/meldwindow.py
-index d1ab4d8..5842499 100644
+index c6c3484..c8fa9d0 100644
 --- a/meld/meldwindow.py
 +++ b/meld/meldwindow.py
 @@ -437,6 +437,15 @@ class MeldWindow(Gtk.ApplicationWindow):

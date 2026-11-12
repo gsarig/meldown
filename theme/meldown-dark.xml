@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Meld colour scheme matching PhpStorm's "Islands Dark" theme, so Meld's merge
-  view looks like the IntelliJ merge tool it replaces.
+  meldown's dark colour scheme for Meld.
 
   Editor and syntax colours come from Islands Dark
   (platform/platform-resources/src/themes/islands/IslandSchemeDark.xml in
@@ -16,9 +15,9 @@
 
   Installed by copying into ~/.local/share/gtksourceview-4/styles (README.md).
 -->
-<style-scheme id="intellij-islands-dark" name="IntelliJ Islands Dark" version="1.0">
+<style-scheme id="meldown-dark" name="meldown Dark" version="1.0">
   <author>Giorgos Sarigiannidis</author>
-  <description>PhpStorm Islands Dark editor colours with IntelliJ's diff colours</description>
+  <description>Dark editor and diff colours for meldown</description>
 
   <!-- Editor -->
   <style name="text" foreground="#bcbec4" background="#191a1c"/>

@@ -1,4 +1,4 @@
-From 9d4d8e8d13aba9a16881c99360ebd6f13f0612c5 Mon Sep 17 00:00:00 2001
+From b863a3ac20dee478d06abe43fb624b5c77268608 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 15:50:31 +0200
 Subject: [PATCH 6/6] Conflicts tab: say how many files Resolve simple
@@ -14,7 +14,7 @@ does not draw the eye with its colour.
  1 file changed, 54 insertions(+), 21 deletions(-)
 
 diff --git a/meld/conflictsview.py b/meld/conflictsview.py
-index 3d5c90b..78f9e46 100644
+index 89acd3c..d0abac5 100644
 --- a/meld/conflictsview.py
 +++ b/meld/conflictsview.py
 @@ -210,9 +210,16 @@ class ConflictsView(Gtk.Box, MeldDoc):

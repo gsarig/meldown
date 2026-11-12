@@ -1,11 +1,11 @@
-From de15996690a7187fac13c6b361e2bb833427f173 Mon Sep 17 00:00:00 2001
+From 7f0ee8f07cd70a795cea69f2bb5087f1a8b159d0 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Wed, 11 Nov 2026 20:29:03 +0200
 Subject: [PATCH 3/6] Add a base-anchored three-way merge model
 
 Stock Meld diffs the result against each side and recomputes after every
 edit, so an applied change just stops being a difference and a dismissed
-one comes back. Like PhpStorm, fix the changes once against the common
+one comes back. Instead, fix the changes once against the common
 base and read each one's state from the result text: applied when the
 text there equals that side (or both sides joined, or the magic wand's
 word-level merge); only dismissals are stored, as the text they were
@@ -28,7 +28,7 @@ new 'resolved'. Nothing uses it yet; the merge view comes next.
 
 diff --git a/meld/matchers/anchored.py b/meld/matchers/anchored.py
 new file mode 100644
-index 0000000..dc472dd
+index 0000000..fceced7
 --- /dev/null
 +++ b/meld/matchers/anchored.py
 @@ -0,0 +1,704 @@
@@ -51,9 +51,9 @@ index 0000000..dc472dd
 +
 +Stock Meld diffs the result pane against each side and recomputes after
 +every edit, so a change it applied simply stops being a difference and a
-+dismissed change comes straight back. PhpStorm instead fixes the changes
-+once, against the common base, and tracks each one's state. This module
-+does the same:
++dismissed change comes straight back. This module instead fixes the
++changes once, against the common base, and tracks each one's state, as
++follows:
 +
 +- Change groups are worked out once from base->left and base->right. In a
 +  merge the left, base and right texts never change, only the result does.
