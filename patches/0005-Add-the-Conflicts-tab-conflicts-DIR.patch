@@ -1,7 +1,7 @@
 From 1bff45a694a7d117aec4d3f70625822890fd260a Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 01:24:56 +0200
-Subject: [PATCH 5/5] Add the Conflicts tab (--conflicts DIR)
+Subject: [PATCH 5/6] Add the Conflicts tab (--conflicts DIR)
 
 PhpStorm's Conflicts dialog as a Meld tab: every conflicted file of a git
 repository, grouped Unresolved, Auto-resolved and Resolved, with Yours

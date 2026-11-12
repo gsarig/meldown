@@ -1,7 +1,7 @@
 From 55735d86fdbe299b79b55ae880b0d410470c26d9 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 00:42:00 +0200
-Subject: [PATCH 4/5] Add the PhpStorm-style merge view (--anchored-merge)
+Subject: [PATCH 4/6] Add the PhpStorm-style merge view (--anchored-merge)
 
 A three-way merge opened with --anchored-merge starts the result from the
 base and puts an arrow and an X on every change: the arrow applies that

@@ -1,0 +1,152 @@
+From 9d4d8e8d13aba9a16881c99360ebd6f13f0612c5 Mon Sep 17 00:00:00 2001
+From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
+Date: Thu, 12 Nov 2026 15:50:31 +0200
+Subject: [PATCH 6/6] Conflicts tab: say how many files Resolve simple
+ conflicts would merge, grey out empty groups
+
+The button now reads 'Resolve simple conflicts (N files)' and is greyed out
+when no unresolved file merges without a real conflict, so it no longer
+looks like it will do something it will not. A group with no files keeps
+its place but is drawn in grey, so an empty Unresolved or Resolved header
+does not draw the eye with its colour.
+---
+ meld/conflictsview.py | 75 +++++++++++++++++++++++++++++++------------
+ 1 file changed, 54 insertions(+), 21 deletions(-)
+
+diff --git a/meld/conflictsview.py b/meld/conflictsview.py
+index 3d5c90b..78f9e46 100644
+--- a/meld/conflictsview.py
++++ b/meld/conflictsview.py
+@@ -210,9 +210,16 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         button.connect('clicked', lambda *a: self.accept(path, stage))
+         return self._cell(button, BUTTON_WIDTH)
+ 
+-    def _group(self, mark, title, count, note=''):
+-        text = f'{mark} <b>{GLib.markup_escape_text(title)}</b> '
+-        text += _dim(f'{count} file{"s" if count != 1 else ""}')
++    def _group(self, glyph, colour, title, count, note=''):
++        files = f'{count} file{"s" if count != 1 else ""}'
++        if count:
++            text = (f'<span foreground="{colour}">{glyph}</span> '
++                    f'<b>{GLib.markup_escape_text(title)}</b> ' + _dim(files))
++        else:
++            # An empty group stays in place, so rows do not jump as files
++            # move between groups, but in grey, so its colour does not
++            # draw the eye.
++            text = _dim(f'{glyph} {title} {files}')
+         if note:
+             text += '  ' + _dim(note)
+         self._row([(self._label(text), True)], selectable=False)
+@@ -250,8 +257,7 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         ], selectable=False)
+ 
+         unresolved = self._unresolved()
+-        self._group('<span foreground="#f75464">✕</span>', 'Unresolved',
+-                    len(unresolved))
++        self._group('✕', '#f75464', 'Unresolved', len(unresolved))
+         for path in unresolved:
+             stages = self.current[path]
+             cells = [(self._file_label(path, ''), True)]
+@@ -262,15 +268,15 @@ class ConflictsView(Gtk.Box, MeldDoc):
+ 
+         auto = self._pending_auto()
+         if auto:
+-            self._group('<span foreground="#e5c07b">✨</span>', 'Auto-resolved',
+-                        len(auto), 'open one to check it; Accept and finish stages them')
++            self._group('✨', '#e5c07b', 'Auto-resolved', len(auto),
++                        'open one to check it; Accept and finish stages them')
+             for path in auto:
+                 self._row([(self._file_label(path, ''), True),
+                            (self._label(_dim('merged, not staged yet')), False)],
+                           path=path)
+ 
+         resolved = sorted(p for p in self.initial if p not in self.current)
+-        self._group('<span foreground="#6aab73">✓</span>', 'Resolved', len(resolved))
++        self._group('✓', '#6aab73', 'Resolved', len(resolved))
+         for path in resolved:
+             self._row([(self._file_label(path, ''), True),
+                        (self._label(_dim(self.outcome.get(path, 'resolved'))), False)],
+@@ -286,6 +292,7 @@ class ConflictsView(Gtk.Box, MeldDoc):
+                           if getattr(r, 'path', None)), None)
+             if first is not None:
+                 self.listbox.select_row(first)
++        self._update_simple()
+         self._update_buttons()
+ 
+     def _update_buttons(self):
+@@ -301,6 +308,43 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         else:
+             self.hint.set_text('All conflicts resolved')
+ 
++    def _simple(self) -> Dict[str, bytes]:
++        """Each unresolved file that merges word by word with no real
++        conflict, with its merged text. A file open in a merge tab is left
++        to that tab."""
++        found = {}
++        for path in self._unresolved():
++            if path in self.tabs:
++                continue
++            try:
++                stages, contents = self._contents(path)
++            except (OSError, subprocess.CalledProcessError):
++                continue
++            if not mergeable(stages, contents):
++                continue
++            contents.setdefault(BASE, b'')
++            merged = auto_resolve(contents)
++            if merged is not None:
++                found[path] = merged
++        return found
++
++    def _update_simple(self):
++        """Say how many files the button would merge, and grey it out
++        when there are none, so it never looks like it will do something
++        it will not."""
++        count = len(self._simple())
++        label = '✨ Resolve simple conflicts'
++        if count:
++            label += f' ({count} file{"s" if count != 1 else ""})'
++            self.simple_button.set_tooltip_text(
++                'Merge every file whose changes do not overlap, word by word; '
++                'they go to Auto-resolved for review')
++        else:
++            self.simple_button.set_tooltip_text(
++                'Every unresolved file has a real conflict to resolve by hand')
++        self.simple_button.set_label(label)
++        self.simple_button.set_sensitive(bool(count))
++
+     def _contents(self, path):
+         stages = self.current.get(path, set())
+         return stages, {s: stage_bytes(self.repo, path, s) for s in stages}
+@@ -365,6 +409,7 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         doc.close_signal.connect(
+             lambda _doc, status: self.on_merge_closed(path, status))
+         self.tabs[path] = doc
++        self._update_simple()
+         notebook.set_current_page(notebook.page_num(doc))
+ 
+     def on_merge_closed(self, path, status):
+@@ -410,19 +455,7 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         """Merge every unresolved file that has no real conflict, word by
+         word, and move it to Auto-resolved without staging it."""
+         done = 0
+-        for path in self._unresolved():
+-            if path in self.tabs:
+-                continue
+-            try:
+-                stages, contents = self._contents(path)
+-            except (OSError, subprocess.CalledProcessError):
+-                continue
+-            if not mergeable(stages, contents):
+-                continue
+-            contents.setdefault(BASE, b'')
+-            merged = auto_resolve(contents)
+-            if merged is None:
+-                continue
++        for path, merged in self._simple().items():
+             try:
+                 with open(os.path.join(self.repo, path), 'wb') as handle:
+                     handle.write(merged)
+-- 
+2.43.0
+
