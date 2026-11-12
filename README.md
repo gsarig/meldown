@@ -17,7 +17,7 @@ Stock Meld opens a three-way merge with the result already half-merged, and ever
 
 The workflow is inspired by the merge tool in JetBrains IDEs.
 
-Tested on Ubuntu 24.04 under WSL 2 (WSLg). Other Linux distributions should work the same way.
+meldown is a personal project, built for my own workflow and shared as is. It is tested only on Ubuntu 24.04 under WSL 2 (other Linux distributions should work the same way), and it may lag behind new Meld releases. It is not a separate app or a replacement for Meld: it is a set of patches to Meld's own source, applied to the version in `MELD_VERSION`, and Meld itself is the work of its developers.
 
 ## What is here
 
