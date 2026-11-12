@@ -1,4 +1,4 @@
-From ee2f29e53b109922b415a847e43d6e81ee68cb39 Mon Sep 17 00:00:00 2001
+From 61817dff6a2dc6f306db8d6bb3a72efbec6d140c Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 20:33:25 +0200
 Subject: [PATCH 7/7] Conflicts list: a side panel beside the merge, with a
@@ -14,7 +14,8 @@ merge view moved to another container re-runs one-time setup in its
 widgets.
 
 In the side view, clicking a file shows its merge, open files carry a dot,
-Accept yours and Accept theirs show on the selected row and on hover, and
+Accept yours and Accept theirs show on every row, clickable on the
+selected one, and
 saving opens the next unresolved file (Save and next file). From the list,
 saving never closes the window. Closing the window asks the list after
 every tab and only when all agreed, since its close ends Meld with its exit
@@ -23,12 +24,12 @@ status; both decisions are pure functions tested in test_conflicts.
  data/org.gnome.Meld.gschema.xml |   9 +
  meld/anchoredview.py            |  34 +++-
  meld/conflicts.py               |  18 ++
- meld/conflictsview.py           | 320 ++++++++++++++++++++++++++++++--
+ meld/conflictsview.py           | 303 ++++++++++++++++++++++++++++++--
  meld/meldwindow.py              |  37 +++-
  meld/resources/ui/appwindow.ui  |  62 ++++++-
  meld/ui/notebook.py             |  12 +-
  test/test_conflicts.py          |  22 +++
- 8 files changed, 475 insertions(+), 39 deletions(-)
+ 8 files changed, 459 insertions(+), 38 deletions(-)
 
 diff --git a/data/org.gnome.Meld.gschema.xml b/data/org.gnome.Meld.gschema.xml
 index d503a0c..d199568 100644
@@ -143,7 +144,7 @@ index 993fd78..f6a5384 100644
 +    would read as "the last tab"."""
 +    return page_num >= 0
 diff --git a/meld/conflictsview.py b/meld/conflictsview.py
-index d0abac5..629d959 100644
+index d0abac5..dbe7509 100644
 --- a/meld/conflictsview.py
 +++ b/meld/conflictsview.py
 @@ -22,6 +22,13 @@ finish. A file opens in the anchored merge view (meld/anchoredview.py) in
@@ -160,15 +161,6 @@ index d0abac5..629d959 100644
  The column titles and the header come from the wrapper script through
  MELD_CONFLICTS_YOURS, MELD_CONFLICTS_THEIRS and MELD_CONFLICTS_HEADER, so
  the branch naming (which flips in a rebase) lives in one place.
-@@ -35,7 +42,7 @@ import subprocess
- import tempfile
- from typing import Dict, Optional, Set
- 
--from gi.repository import Gio, GLib, Gtk, Pango
-+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
- 
- from meld import misc
- from meld.conflicts import (
 @@ -51,6 +58,7 @@ from meld.conflicts import (
  )
  from meld.melddoc import MeldDoc
@@ -343,14 +335,14 @@ index d0abac5..629d959 100644
          box = Gtk.Box(spacing=8)
          box.props.margin = 6
          for widget, expand in children:
-@@ -231,6 +372,93 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -231,6 +372,78 @@ class ConflictsView(Gtk.Box, MeldDoc):
              text += '  ' + _dim(folder)
          return self._label(text)
  
 +    def _side_row(self, path, note=None, accept=False, selectable=True):
 +        """A compact row for the side view: the file name with its folder
 +        under it, and for an unresolved file Accept yours / Accept theirs,
-+        shown on the selected row and on hover."""
++        always shown but clickable only on the selected row."""
 +        folder, name = os.path.split(path)
 +        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
 +        name_label = self._label(GLib.markup_escape_text(name))
@@ -369,36 +361,21 @@ index d0abac5..629d959 100644
 +            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 +            outer.pack_start(text, False, False, 0)
 +            outer.pack_start(accept_box, False, False, 0)
-+            # A list row has no window of its own, so it never hears the
-+            # pointer come and go; an event box does.
-+            hover = Gtk.EventBox()
-+            hover.add(outer)
-+            children = [(hover, True)]
++            children = [(outer, True)]
 +        row = self._row(children, selectable=selectable, path=path)
 +        row.name_label = name_label
 +        row.name = name
 +        row.accept_box = accept_box
-+        if accept_box is not None:
-+            hover.connect('enter-notify-event', self._on_row_hover, row, True)
-+            hover.connect('leave-notify-event', self._on_row_hover, row, False)
 +        return row
 +
-+    def _on_row_hover(self, widget, event, row, inside):
-+        # Moving onto the row's own buttons is a leave with detail
-+        # INFERIOR; the pointer is still over the row.
-+        if not inside and event.detail == Gdk.NotifyType.INFERIOR:
-+            return False
-+        selected = self.listbox.get_selected_row() is row
-+        row.accept_box.set_visible(inside or selected)
-+        return False
-+
 +    def _update_marks(self):
-+        """In the side view: Accept buttons on the selected row only, and a
++        """In the side view: Accept buttons clickable on the selected row
++        only (shown on every row, so nothing appears or vanishes), and a
 +        dot on each file that is open and not finished."""
 +        selected = self.listbox.get_selected_row()
 +        for row in self.listbox.get_children():
 +            if row.accept_box is not None:
-+                row.accept_box.set_visible(row is selected)
++                row.accept_box.set_sensitive(row is selected)
 +            if row.name_label is not None:
 +                dot = '● ' if self._unfinished(row.path) else ''
 +                row.name_label.set_markup(
@@ -437,7 +414,7 @@ index d0abac5..629d959 100644
      # -- state -----------------------------------------------------------------
  
      def _unresolved(self):
-@@ -250,16 +478,29 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -250,16 +463,29 @@ class ConflictsView(Gtk.Box, MeldDoc):
          for child in self.listbox.get_children():
              self.listbox.remove(child)
  
@@ -472,7 +449,7 @@ index d0abac5..629d959 100644
              cells = [(self._file_label(path, ''), True)]
              for stage in (OURS, THEIRS):
                  cells.append((self._label(side_status(stages, stage), STATUS_WIDTH), False))
-@@ -271,6 +512,9 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -271,6 +497,9 @@ class ConflictsView(Gtk.Box, MeldDoc):
              self._group('✨', '#e5c07b', 'Auto-resolved', len(auto),
                          'open one to check it; Accept and finish stages them')
              for path in auto:
@@ -482,7 +459,7 @@ index d0abac5..629d959 100644
                  self._row([(self._file_label(path, ''), True),
                             (self._label(_dim('merged, not staged yet')), False)],
                            path=path)
-@@ -278,22 +522,34 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -278,22 +507,34 @@ class ConflictsView(Gtk.Box, MeldDoc):
          resolved = sorted(p for p in self.initial if p not in self.current)
          self._group('✓', '#6aab73', 'Resolved', len(resolved))
          for path in resolved:
@@ -526,7 +503,7 @@ index d0abac5..629d959 100644
  
      def _update_buttons(self):
          row = self.listbox.get_selected_row()
-@@ -301,7 +557,8 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -301,7 +542,8 @@ class ConflictsView(Gtk.Box, MeldDoc):
          self.merge_button.set_sensitive(bool(path) and self._can_merge(path))
          self.finish_button.set_sensitive(not self._unresolved())
          if self._unresolved():
@@ -536,7 +513,7 @@ index d0abac5..629d959 100644
          elif self._pending_auto():
              self.hint.set_text('Nothing left to resolve; Accept and finish '
                                 'stages the auto-resolved files')
-@@ -365,6 +622,21 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -365,6 +607,21 @@ class ConflictsView(Gtk.Box, MeldDoc):
  
      # -- actions ---------------------------------------------------------------
  
@@ -558,7 +535,7 @@ index d0abac5..629d959 100644
      def on_row_activated(self, listbox, row):
          if getattr(row, 'path', None):
              self.open_merge(row.path)
-@@ -405,12 +677,16 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -405,12 +662,16 @@ class ConflictsView(Gtk.Box, MeldDoc):
          doc = self.window.append_filemerge(
              files, merge_output=output, anchored=True)
          doc.set_labels([self.yours, f'Result: {path}', self.theirs])
@@ -576,7 +553,7 @@ index d0abac5..629d959 100644
  
      def on_merge_closed(self, path, status):
          """A merge tab closed: status 0 means it was saved with nothing
-@@ -427,6 +703,14 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -427,6 +688,14 @@ class ConflictsView(Gtk.Box, MeldDoc):
          if notebook.page_num(self) >= 0:
              notebook.set_current_page(notebook.page_num(self))
          self.refresh()
