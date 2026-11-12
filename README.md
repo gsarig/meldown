@@ -31,6 +31,16 @@ Tested on Ubuntu 24.04 under WSL 2 (WSLg). Other Linux distributions should work
 
 ## Setup
 
+### Quick setup with an AI agent
+
+Paste this into Claude Code or a similar coding agent:
+
+```text
+Set up meldown from https://github.com/gsarig/meldown on this machine: clone it, then follow its README's Manual setup section, including the Theme part. Ask me before any sudo command or change to my global git config. When done, build the test repo with make-test-repo.sh and tell me the command to try it.
+```
+
+### Manual setup
+
 Meld runs straight from its source folder, without a build. The distribution's `meld` package is installed only for the libraries it pulls in, and `libglib2.0-dev-bin` for `glib-compile-resources`, which the first run uses to compile Meld's UI files. The commands below are for Ubuntu and Debian; on other distributions, install their `meld` package and `glib-compile-resources` instead.
 
 ```bash
@@ -58,7 +68,7 @@ git config --global --get mergetool.meldown.trustExitCode
 
 The wrapper looks for Meld in `~/.local/src/meld`; set `MELD_SRC` if you cloned it elsewhere.
 
-### Theme (optional)
+#### Theme (optional)
 
 The dark colour scheme takes its editor colours from JetBrains' open-source Islands Dark scheme and its diff colours from Darcula (see `NOTICE`), and the font is [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) (SIL Open Font License). The gutter icons replace Meld's own black ones, which ignore a dark theme; they go under the Adwaita theme because Meld's bundled copies win over a user hicolor folder. A source checkout counts as a development build, so GTK gives it a striped title bar, which the stylesheet line removes.
 
