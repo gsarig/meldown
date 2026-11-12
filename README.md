@@ -2,6 +2,10 @@
 
 Patches that give [Meld](https://meld.app/) a calmer way to resolve merge conflicts, where you apply or dismiss each change and see every conflicted file in one list, plus a `git mergetool` wrapper and a dark theme to match.
 
+![meldown demo: the side panel, the same list as tabs, then resolving both files in the side panel](.github/assets/meldown.gif)
+
+*[Watch the full-quality video](.github/assets/meldown.mp4).*
+
 ## What meldown adds to Meld
 
 Stock Meld opens a three-way merge with the result already half-merged, and every change shows as a copy between panes. meldown keeps Meld and changes how a merge works:
@@ -17,10 +21,6 @@ Stock Meld opens a three-way merge with the result already half-merged, and ever
 - ✅ **Counters for what is left:** conflicts in the status bar, changes and unresolved changes in the toolbar, and a dot on every open, unfinished file.
 - ✅ **Branch names as pane titles** for merges, rebases and cherry-picks.
 - ✅ **A correct exit status for `git mergetool`.** Meld exits 0 only when the result was saved with nothing unresolved, so with `trustExitCode` git never marks a half-done file as resolved.
-
-![meldown demo: the side panel, the same list as tabs, then resolving both files in the side panel](.github/assets/meldown.gif)
-
-*[Watch the full-quality video](.github/assets/meldown.mp4).*
 
 The workflow is inspired by the merge tool in JetBrains IDEs.
 
