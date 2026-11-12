@@ -2,9 +2,7 @@
 
 Patches that give [Meld](https://meld.app/) a calmer way to resolve merge conflicts, where you apply or dismiss each change and see every conflicted file in one list, plus a `git mergetool` wrapper and a dark theme to match.
 
-![meldown demo: the side panel, the same list as tabs, then resolving both files in the side panel](.github/assets/meldown.gif)
-
-*[Watch the full-quality video](.github/assets/meldown.mp4).*
+https://github.com/user-attachments/assets/3a2966fd-55ed-4ef1-a44d-787648d7727d
 
 ## What meldown adds to Meld
 
