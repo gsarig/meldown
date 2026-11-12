@@ -1,0 +1,1177 @@
+From 55735d86fdbe299b79b55ae880b0d410470c26d9 Mon Sep 17 00:00:00 2001
+From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
+Date: Thu, 12 Nov 2026 00:42:00 +0200
+Subject: [PATCH 4/5] Add the PhpStorm-style merge view (--anchored-merge)
+
+A three-way merge opened with --anchored-merge starts the result from the
+base and puts an arrow and an X on every change: the arrow applies that
+side (on a conflict, a second arrow adds the other side after it), the X
+dismisses it. A toolbar applies non-conflicting changes from the left,
+right or both, runs the magic wand on simple conflicts, and counts
+changes, unresolved changes and conflicts; a bottom bar accepts a whole
+side, or saves and closes (the window when it is the only tab, so git
+mergetool moves on to the next file). With changes still unresolved, Save and
+close asks first, since the file would stay unresolved in git. Applied lines are tinted, dismissed ones struck through,
+and handled changes get a quiet new 'resolved' colour (meld:resolved in
+the style schemes).
+
+The side panes are read-only and text filters are off. Reopening a
+result saved earlier (no conflict markers) starts from it. Meld exits 0
+only when the result was saved with nothing unresolved, so git mergetool
+with trustExitCode leaves half-done files unresolved. GApplication drops
+a local command line's exit status once the main loop has run, so the
+first instance kept exiting 0; meldapp now keeps the status for bin/meld
+to return.
+
+Inline word marks now pair lines first (ignoring indentation) and compare
+words only within changed line pairs, with line breaks as tokens and
+insertions slid to line starts, so lines that only moved or were
+re-indented inside a conflict mark nothing. Marks are cleared from every
+removed or reshaped chunk, since conflicts carry them too.
+---
+ bin/meld                                  |   4 +-
+ data/styles/meld-base.style-scheme.xml.in |   2 +
+ data/styles/meld-dark.style-scheme.xml.in |   2 +
+ meld/actiongutter.py                      |  67 ++++
+ meld/anchoredview.py                      | 400 ++++++++++++++++++++++
+ meld/const.py                             |   2 +
+ meld/filediff.py                          |  62 +++-
+ meld/matchers/diffutil.py                 |   5 +-
+ meld/matchers/words.py                    | 139 +++++++-
+ meld/meldapp.py                           |  21 +-
+ meld/meldwindow.py                        |  17 +-
+ meld/style.py                             |   3 +
+ test/test_anchored.py                     |   7 +
+ test/test_words.py                        |  22 +-
+ 14 files changed, 728 insertions(+), 25 deletions(-)
+ create mode 100644 meld/anchoredview.py
+
+diff --git a/bin/meld b/bin/meld
+index 63bb0bb..566d456 100755
+--- a/bin/meld
++++ b/bin/meld
+@@ -479,7 +479,9 @@ def run_application():
+         GLib.unix_signal_add(
+             GLib.PRIORITY_DEFAULT, signal.SIGINT, lambda *args: app.quit())
+ 
+-    return app.run(sys.argv)
++    status = app.run(sys.argv)
++    # Local patch: see local_exit_status in meld/meldapp.py.
++    return status or getattr(app, 'local_exit_status', 0)
+ 
+ 
+ def main():
+diff --git a/data/styles/meld-base.style-scheme.xml.in b/data/styles/meld-base.style-scheme.xml.in
+index e0181b3..55e2703 100644
+--- a/data/styles/meld-base.style-scheme.xml.in
++++ b/data/styles/meld-base.style-scheme.xml.in
+@@ -8,6 +8,8 @@
+   <style name="meld:conflict" background="#ffa5a3" foreground="#ff0000" line-background="#ff4f4c"/>
+   <style name="meld:delete" background="#ffffff" foreground="#880000" line-background="#cccccc"/>
+   <style name="meld:error" background="#fce94f" foreground="#faad3d" line-background="#fade0a"/>
++  <!-- Local patch: a handled change in the base-anchored merge view -->
++  <style name="meld:resolved" background="#f2f2f2" foreground="#bbbbbb" line-background="#d4d4d4"/>
+   <style name="meld:inline" background="#8ac2ff"/>
+   <style name="meld:current-line-highlight" foreground="#333333" background="#rgba(255, 255, 0, 0.25)"/>
+   <style name="meld:unknown-text" foreground="#888888"/>
+diff --git a/data/styles/meld-dark.style-scheme.xml.in b/data/styles/meld-dark.style-scheme.xml.in
+index 8e9a2ad..8784a56 100644
+--- a/data/styles/meld-dark.style-scheme.xml.in
++++ b/data/styles/meld-dark.style-scheme.xml.in
+@@ -9,6 +9,8 @@
+   <!-- FIXME: delete background should be @theme_bg_color; line should be shaded of that -->
+   <style name="meld:delete" background="#ffffff" foreground="#a40000" line-background="#cccccc"/>
+   <style name="meld:error" background="#fce94f" foreground="#faad3d" line-background="#fdf8cd"/>
++  <!-- Local patch: a handled change in the base-anchored merge view -->
++  <style name="meld:resolved" background="#262626" foreground="#555555" line-background="#4a4a4a"/>
+   <style name="meld:inline" background="#24527e"/>
+   <style name="meld:current-line-highlight" foreground="#eeeeee" background="#rgba(17, 17, 0, 0.25)"/>
+   <style name="meld:unknown-text" foreground="#aaaaaa"/>
+diff --git a/meld/actiongutter.py b/meld/actiongutter.py
+index ee18a62..efcbc32 100644
+--- a/meld/actiongutter.py
++++ b/meld/actiongutter.py
+@@ -152,12 +152,27 @@ class ActionGutter(Gtk.DrawingArea):
+     ) -> None:
+         ...
+ 
++    # Local patch: the base-anchored merge view (meld/anchoredview.py)
++    # places its own buttons, an arrow and an X per unresolved change, and
++    # handles their clicks itself.
++    @GObject.Signal
++    def anchored_action_activated(
++        self,
++        action: str,  # 'apply' or 'dismiss'
++        index: int,   # change group
++        side: int,    # 0 left, 1 right
++    ) -> None:
++        ...
++
+     def __init__(self):
+         super().__init__()
+ 
+         # Object-type defaults
+         self.chunks = []
+         self.action_map = {}
++        # None normally; in the anchored merge view, a list of
++        # (line, [(icon name, action, group index, side), ...]).
++        self.anchored_buttons = None
+ 
+         # State for "button" implementation
+         self.buttons = []
+@@ -247,6 +262,11 @@ class ActionGutter(Gtk.DrawingArea):
+ 
+     def activate(self, chunk):
+ 
++        if isinstance(chunk, tuple) and chunk and chunk[0] == 'anchored':
++            _tag, action, index, side = chunk
++            self.anchored_action_activated.emit(action, index, side)
++            return
++
+         action = self._classify_change_actions(chunk)
+ 
+         # FIXME: When fully transitioned to GAction, we should see
+@@ -339,6 +359,9 @@ class ActionGutter(Gtk.DrawingArea):
+             context.set_source_rgba(*self.line_colors[change_type])
+             context.stroke()
+ 
++            if self.anchored_buttons is not None:
++                continue
++
+             # Button rendering and tracking
+             action = self._classify_change_actions(chunk)
+             if action is None:
+@@ -379,8 +402,52 @@ class ActionGutter(Gtk.DrawingArea):
+             Gtk.render_icon(
+                 button_style_context, context, pixbuf, icon_x, icon_y)
+ 
++        if self.anchored_buttons is not None:
++            self._draw_anchored_buttons(
++                context, view, buf, width, gutter_y_translate,
++                view.get_line_num_for_y(view_y_start),
++                view.get_line_num_for_y(view_y_start + height))
++
+         context.restore()
+ 
++    def _draw_anchored_buttons(
++            self, context, view, buf, width, y_translate, first, last):
++        """Draw the anchored merge view's buttons, side by side on the
++        first line of each change, and record them for clicks."""
++        for line, actions in self.anchored_buttons:
++            if line < first or line > last + 1 or not actions:
++                continue
++            it = buf.get_iter_at_line(min(line, buf.get_line_count() - 1))
++            button_y, button_height = view.get_line_yrange(it)
++            if line >= buf.get_line_count():
++                button_y += button_height
++            button_y += 1
++            button_height -= 2
++            button_width = (width - 2) // len(actions)
++            for n, (icon, action, index, side) in enumerate(actions):
++                button_x = 1 + n * button_width
++                payload = ('anchored', action, index, side)
++                style = get_style(None, 'button.flat.image-button')
++                if payload == self.pointer_chunk:
++                    style.set_state(Gtk.StateFlags.PRELIGHT)
++                Gtk.render_background(
++                    style, context, button_x, button_y, button_width,
++                    button_height)
++                Gtk.render_frame(
++                    style, context, button_x, button_y, button_width,
++                    button_height)
++                self.buttons.append((
++                    button_x, button_y + y_translate,
++                    button_x + button_width,
++                    button_y + y_translate + button_height,
++                    payload,
++                ))
++                pixbuf = ActionIcons.load(icon)
++                Gtk.render_icon(
++                    style, context, pixbuf,
++                    button_x + (button_width - pixbuf.props.width) // 2,
++                    button_y + (button_height - pixbuf.props.height) // 2)
++
+     def _classify_change_actions(self, change) -> Optional[ActionMode]:
+         """Classify possible actions for the given change
+ 
+diff --git a/meld/anchoredview.py b/meld/anchoredview.py
+new file mode 100644
+index 0000000..a41ac53
+--- /dev/null
++++ b/meld/anchoredview.py
+@@ -0,0 +1,400 @@
++# Copyright (C) 2026 Giorgos Sarigiannidis
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 2 of the License, or (at
++# your option) any later version.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++"""The base-anchored merge view (local patch, not upstream Meld).
++
++A three-way FileDiff opened with --anchored-merge gets one of these. It
++works like PhpStorm's merge window: the result starts as the base, every
++change has an arrow that applies it and an X that dismisses it, a toolbar
++applies all non-conflicting changes or runs the magic wand, and a counter
++shows what is left. The state lives in meld/matchers/anchored.py; this
++module only draws it and turns clicks into edits of the result buffer.
++
++FileDiff calls in at a handful of hook points (look for "anchored" in
++filediff.py), so the patch to Meld's own files stays small.
++"""
++
++import logging
++from typing import List, Optional
++
++from gi.repository import Gdk, GLib, Gtk
++
++from meld import misc
++from meld.matchers.anchored import (
++    LEFT,
++    RIGHT,
++    Edit,
++    SideState,
++    exit_status,
++)
++
++log = logging.getLogger(__name__)
++
++CONFLICT_MARKERS = ('<<<<<<<', '>>>>>>>')
++APPLIED_TAG = 'anchored-applied'
++DISMISSED_TAG = 'anchored-dismissed'
++
++# Gutter indexes in FileDiff.actiongutter: left pane -> result, and right
++# pane -> result. The two result -> side gutters show nothing here.
++GUTTERS = {LEFT: 0, RIGHT: 3}
++
++
++def read_saved_result(path: Optional[str]) -> Optional[str]:
++    """The merge output's text when it is a result saved earlier, or None:
++    missing, unreadable, or still holding git's conflict markers (a fresh
++    conflict, which starts from the base instead)."""
++    if not path:
++        return None
++    try:
++        with open(path, 'rb') as handle:
++            text = handle.read().decode('utf-8')
++    except (OSError, UnicodeDecodeError):
++        return None
++    for line in text.splitlines():
++        if line.startswith(CONFLICT_MARKERS):
++            return None
++    return text
++
++
++class AnchoredView:
++
++    def __init__(self, filediff):
++        self.fd = filediff
++        self.saved_resolved = False
++        self.edited_since_save = True
++        self._close_after_save = False
++        self._build_toolbars()
++        for side, index in GUTTERS.items():
++            gutter = filediff.actiongutter[index]
++            gutter.props.width_request = 40
++            gutter.connect('anchored-action-activated', self.on_action)
++        for gutter in filediff.actiongutter:
++            gutter.anchored_buttons = []
++        for buf in filediff.textbuffer:
++            buf.create_tag(
++                APPLIED_TAG,
++                paragraph_background_rgba=Gdk.RGBA(0.27, 0.44, 0.32, 0.22))
++            buf.create_tag(
++                DISMISSED_TAG, strikethrough=True,
++                foreground_rgba=Gdk.RGBA(0.44, 0.45, 0.48, 1.0))
++
++    # -- widgets ---------------------------------------------------------------
++
++    def _button(self, label, callback, tooltip=None):
++        button = Gtk.Button.new_with_label(label)
++        button.get_style_context().add_class('flat')
++        button.connect('clicked', lambda *args: callback())
++        if tooltip:
++            button.set_tooltip_text(tooltip)
++        return button
++
++    def _build_toolbars(self):
++        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
++        top.props.margin = 4
++        top.pack_start(self._button('↑', lambda: self.go_to_change(-1),
++                                    'Previous unresolved change'), False, False, 0)
++        top.pack_start(self._button('↓', lambda: self.go_to_change(1),
++                                    'Next unresolved change'), False, False, 0)
++        top.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL),
++                       False, False, 6)
++        label = Gtk.Label(label='Apply non-conflicting changes:')
++        label.get_style_context().add_class('dim-label')
++        top.pack_start(label, False, False, 4)
++        top.pack_start(self._button('» Left', lambda: self.apply_non_conflicting('left')),
++                       False, False, 0)
++        top.pack_start(self._button('»« All', lambda: self.apply_non_conflicting('all')),
++                       False, False, 0)
++        top.pack_start(self._button('« Right', lambda: self.apply_non_conflicting('right')),
++                       False, False, 0)
++        top.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL),
++                       False, False, 6)
++        top.pack_start(self._button(
++            '✨ Simple conflicts', self.resolve_simple,
++            'Merge conflicts whose two sides changed different words'),
++            False, False, 0)
++        self.counter = Gtk.Label()
++        top.pack_end(self.counter, False, False, 8)
++
++        bottom = Gtk.ActionBar()
++        bottom.pack_start(self._button('Accept left', lambda: self.accept_file(LEFT),
++                                       'Take the whole left file'))
++        bottom.pack_start(self._button('Accept right', lambda: self.accept_file(RIGHT),
++                                       'Take the whole right file'))
++        save = Gtk.Button.new_with_label('Save and close')
++        save.get_style_context().add_class('suggested-action')
++        save.set_tooltip_text(
++            'Save the result and close it; Ctrl+S saves without closing')
++        save.connect('clicked', lambda *args: self.save_and_close())
++        bottom.pack_end(save)
++        self.bottom = bottom
++
++        self.fd.pack_start(top, False, False, 0)
++        self.fd.reorder_child(top, 0)
++        self.fd.pack_end(bottom, False, False, 0)
++        top.show_all()
++        bottom.show_all()
++
++    # -- hooks from FileDiff ---------------------------------------------------
++
++    @property
++    def model(self):
++        return self.fd.linediffer.model
++
++    def prepare(self):
++        """Run in place of FileDiff._merge_files, once every pane has loaded:
++        the middle pane holds the base. Remember it, and when the merge
++        output is a result saved earlier, start from that instead."""
++        fd = self.fd
++        base = list(fd.buffer_texts[1])
++        fd.linediffer.base_lines = base
++        bufdata = fd.textbuffer[1].data
++        path = bufdata.savefile.get_path() if bufdata.savefile else None
++        saved = read_saved_result(path)
++        self._reopened = False
++        # Compared the way BufferLines splits: a final line break leaves an
++        # empty last line, and no line keeps its "\r".
++        if saved is not None and [
++                line.rstrip('\r') for line in saved.split('\n')] != base:
++            fd.textbuffer[1].set_text(saved)
++            self._reopened = True
++        yield 1
++
++    def compared(self):
++        """Run once the comparison is ready (from on_diffs_changed): watch
++        the result for edits, and count a reopened file that was already
++        fully resolved as saved."""
++        if getattr(self, '_watching', False) or self.model is None:
++            return
++        self._watching = True
++        if self._reopened and self.model.counts()[1] == 0:
++            self.saved_resolved = True
++            self.edited_since_save = False
++        self.fd.textbuffer[1].connect('changed', self.on_result_changed)
++
++    def on_result_changed(self, buf):
++        self.edited_since_save = True
++
++    def on_saved(self):
++        model = self.model
++        self.saved_resolved = model is not None and model.counts()[1] == 0
++        self.edited_since_save = False
++        if self._close_after_save:
++            self._close_after_save = False
++            GLib.idle_add(self._close)
++
++    def save_and_close(self):
++        """Save the result, then close: the whole window when this is its
++        only tab (git mergetool waits for Meld to exit before the next
++        file), otherwise just this tab. With changes still unresolved it
++        asks first, since closing then leaves the file unresolved in git.
++        Nothing closes when the save does not start or fails, so a problem
++        stays on screen."""
++        model = self.model
++        unresolved = model.counts()[1] if model is not None else 0
++        if unresolved and not self._confirm_unresolved(unresolved):
++            return
++        self._close_after_save = bool(self.fd.save_file(1))
++
++    def _confirm_unresolved(self, unresolved: int) -> bool:
++        primary = (f'{unresolved} change{"s are" if unresolved != 1 else " is"}'
++                   ' still unresolved')
++        secondary = ('If you save and close now, the file stays unresolved '
++                     'and git mergetool will ask whether to go on to the '
++                     'next file.')
++        response = misc.modal_dialog(
++            primary, secondary,
++            (('_Keep resolving', Gtk.ResponseType.CANCEL, None),
++             ('_Save and close anyway', Gtk.ResponseType.OK,
++              'destructive-action')),
++            parent=self.fd, messagetype=Gtk.MessageType.QUESTION)
++        return response == Gtk.ResponseType.OK
++
++    def _close(self):
++        window = self.fd.get_toplevel()
++        notebook = getattr(window, 'notebook', None)
++        if notebook is not None and notebook.get_n_pages() == 1:
++            window.close()
++        else:
++            self.fd.on_delete_event()
++        return GLib.SOURCE_REMOVE
++
++    def exit_status(self) -> int:
++        return exit_status(self.saved_resolved, self.edited_since_save)
++
++    def conflict_count(self) -> int:
++        return self.model.counts()[2] if self.model is not None else 0
++
++    def on_diffs_changed(self):
++        if self.model is None:
++            return
++        self.compared()
++        self._update_buttons()
++        self._update_counter()
++        self._update_tags()
++
++    # -- drawing ---------------------------------------------------------------
++
++    def _update_buttons(self):
++        model = self.model
++        for side, gutter_index in GUTTERS.items():
++            arrow = 'apply-right' if side == LEFT else 'apply-left'
++            buttons = []
++            for group in model.groups:
++                rng = group.sides[side]
++                if rng is None:
++                    continue
++                if model.side_state(group.index, side) != SideState.UNRESOLVED:
++                    continue
++                apply = (arrow, 'apply', group.index, side)
++                dismiss = ('delete', 'dismiss', group.index, side)
++                # The arrow sits next to the result pane, as in PhpStorm.
++                actions = [dismiss, apply] if side == LEFT else [apply, dismiss]
++                buttons.append((rng[0], actions))
++            gutter = self.fd.actiongutter[gutter_index]
++            gutter.anchored_buttons = buttons
++            gutter.queue_draw()
++
++    def _update_counter(self):
++        changes, unresolved, conflicts = self.model.counts()
++        text = f'{changes} change{"s" if changes != 1 else ""} · '
++        text += f'<b>{unresolved} unresolved</b> · '
++        colour = '#f75464' if conflicts else '#6aab73'
++        text += (f'<span foreground="{colour}">{conflicts} '
++                 f'conflict{"s" if conflicts != 1 else ""}</span>')
++        self.counter.set_markup(text)
++
++    def _tag_lines(self, buf, tag, start, end):
++        if start >= end:
++            return
++        buf.apply_tag_by_name(
++            tag, buf.get_iter_at_line_or_eof(start),
++            buf.get_iter_at_line_or_eof(end))
++
++    def _update_tags(self):
++        model = self.model
++        bufs = self.fd.textbuffer
++        for buf in bufs[:3]:
++            start, end = buf.get_bounds()
++            buf.remove_tag_by_name(APPLIED_TAG, start, end)
++            buf.remove_tag_by_name(DISMISSED_TAG, start, end)
++        side_bufs = {LEFT: bufs[0], RIGHT: bufs[2]}
++        for group in model.groups:
++            any_applied = False
++            for side in (LEFT, RIGHT):
++                rng = group.sides[side]
++                if rng is None:
++                    continue
++                state = model.side_state(group.index, side)
++                if state == SideState.APPLIED:
++                    any_applied = True
++                    self._tag_lines(side_bufs[side], APPLIED_TAG, *rng)
++                elif state == SideState.DISMISSED:
++                    self._tag_lines(side_bufs[side], DISMISSED_TAG, *rng)
++            if any_applied:
++                self._tag_lines(bufs[1], APPLIED_TAG, *model.ranges[group.index])
++
++    # -- actions ---------------------------------------------------------------
++
++    def refresh(self):
++        """Re-tag after a state change that edits no text."""
++        self.fd.linediffer.refresh(self.fd.buffer_filtered[:3])
++
++    def apply_edits(self, edits: List[Edit]):
++        """Apply model edits (last first) to the result as one undo step."""
++        if not edits:
++            return
++        buf = self.fd.textbuffer[1]
++        buf.begin_user_action()
++        try:
++            for edit in edits:
++                self._apply_edit(buf, edit)
++        finally:
++            buf.end_user_action()
++        buf.place_cursor(buf.get_iter_at_line_or_eof(edits[-1].start))
++
++    def _apply_edit(self, buf, edit: Edit):
++        """Replace result lines [start, end) with the edit's lines. The last
++        line of a GtkTextBuffer never has a line break, so edits that reach
++        the end of the buffer drop the final break, or the one before."""
++        count = buf.get_line_count()
++        if edit.start >= count:
++            if edit.lines:
++                buf.insert(buf.get_end_iter(), '\n' + '\n'.join(edit.lines))
++            return
++        start = buf.get_iter_at_line(edit.start)
++        if edit.end >= count:
++            end = buf.get_end_iter()
++            text = '\n'.join(edit.lines)
++            if not edit.lines and edit.start > 0:
++                start.backward_char()
++        else:
++            end = buf.get_iter_at_line(edit.end)
++            text = ''.join(line + '\n' for line in edit.lines)
++        buf.delete(start, end)
++        buf.insert(start, text)
++
++    def on_action(self, gutter, action, index, side):
++        model = self.model
++        if model is None:
++            return
++        if action == 'apply':
++            edit = model.apply(index, side)
++            if edit is not None:
++                self.apply_edits([edit])
++        elif action == 'dismiss':
++            model.dismiss(index, side)
++            self.refresh()
++
++    def apply_non_conflicting(self, which: str):
++        if self.model is not None:
++            self.apply_edits(self.model.apply_non_conflicting(which))
++
++    def resolve_simple(self):
++        if self.model is not None:
++            self.apply_edits(self.model.wand_all())
++
++    def accept_file(self, side: int):
++        """Take one side's whole file, and dismiss every change from the
++        other side so nothing is left to resolve."""
++        model = self.model
++        if model is None:
++            return
++        source = model.left if side == LEFT else model.right
++        self.apply_edits([Edit(0, self.fd.textbuffer[1].get_line_count(), list(source))])
++        for group in model.groups:
++            for s in (LEFT, RIGHT):
++                if model.side_state(group.index, s) == SideState.UNRESOLVED:
++                    model.dismiss(group.index, s)
++        self.refresh()
++
++    def go_to_change(self, direction: int):
++        """Move the result's cursor to the next or previous unresolved
++        change, wrapping around."""
++        model = self.model
++        if model is None:
++            return
++        buf = self.fd.textbuffer[1]
++        line = buf.get_iter_at_mark(buf.get_insert()).get_line()
++        starts = [model.ranges[g.index][0] for g in model.groups
++                  if not model.is_resolved(g.index)]
++        if not starts:
++            return
++        if direction > 0:
++            later = [s for s in starts if s > line]
++            target = later[0] if later else starts[0]
++        else:
++            earlier = [s for s in starts if s < line]
++            target = earlier[-1] if earlier else starts[-1]
++        self.fd.move_cursor(1, min(target, buf.get_line_count() - 1))
+diff --git a/meld/const.py b/meld/const.py
+index f854281..57f6d9d 100644
+--- a/meld/const.py
++++ b/meld/const.py
+@@ -24,6 +24,8 @@ class ChunkAction(enum.Enum):
+ class FileComparisonMode(enum.Enum):
+     AutoMerge = 'AutoMerge'
+     Compare = 'Compare'
++    # Local patch: PhpStorm-style merge (meld/anchoredview.py)
++    AnchoredMerge = 'AnchoredMerge'
+ 
+ 
+ class FileLoadError(enum.IntEnum):
+diff --git a/meld/filediff.py b/meld/filediff.py
+index ef3a89a..4815bb4 100644
+--- a/meld/filediff.py
++++ b/meld/filediff.py
+@@ -38,6 +38,8 @@ from meld.externalhelpers import open_files_external
+ from meld.gutterrendererchunk import GutterRendererChunkLines
+ from meld.iohelpers import find_shared_parent_path, prompt_save_filename
+ from meld.matchers.diffutil import Differ, merged_chunk_order
++from meld.anchoredview import AnchoredView
++from meld.matchers.anchored import AnchoredMergeDiffer
+ from meld.matchers.helpers import CachedSequenceMatcher
+ from meld.matchers.merge import AutoMergeDiffer, Merger
+ from meld.matchers.words import wants_inline_highlight
+@@ -262,8 +264,11 @@ class FileDiff(Gtk.Box, MeldDoc):
+         self.comparison_mode = comparison_mode
+         if comparison_mode == FileComparisonMode.AutoMerge:
+             self.differ = AutoMergeDiffer
++        elif comparison_mode == FileComparisonMode.AnchoredMerge:
++            self.differ = AnchoredMergeDiffer
+         else:
+             self.differ = Differ
++        self.anchored = None
+ 
+         self.warned_bad_comparison = False
+         self._keymask = 0
+@@ -454,6 +459,9 @@ class FileDiff(Gtk.Box, MeldDoc):
+                 'chunk_action_activated', self.on_chunk_action_activated)
+ 
+         self.linediffer.connect("diffs-changed", self.on_diffs_changed)
++        # Local patch: base-anchored merge view hook (meld/anchoredview.py)
++        if self.comparison_mode == FileComparisonMode.AnchoredMerge:
++            self.anchored = AnchoredView(self)
+         self.undosequence.connect("checkpointed", self.on_undo_checkpointed)
+         self.undosequence.connect("can-undo", self.on_can_undo)
+         self.undosequence.connect("can-redo", self.on_can_redo)
+@@ -623,7 +631,9 @@ class FileDiff(Gtk.Box, MeldDoc):
+                 "notify::cursor-position", self.on_cursor_position_changed)
+             buf.handlers = id0, id1, id2, id3, id4
+ 
+-        if self.comparison_mode == FileComparisonMode.AutoMerge:
++        if self.comparison_mode in (
++                FileComparisonMode.AutoMerge,
++                FileComparisonMode.AnchoredMerge):
+             self.textview[0].set_editable(0)
+             self.textview[2].set_editable(0)
+ 
+@@ -1181,6 +1191,10 @@ class FileDiff(Gtk.Box, MeldDoc):
+                                                 None, True)
+ 
+     def _filter_text(self, txt, buf, txt_start_iter, txt_end_iter):
++        # Local patch: base-anchored merge view hook (meld/anchoredview.py)
++        # Text filters would change the text the merge model compares.
++        if self.anchored is not None:
++            return txt
+         dimmed_tag = buf.get_tag_table().lookup("dimmed")
+         buf.remove_tag(dimmed_tag, txt_start_iter, txt_end_iter)
+ 
+@@ -1311,7 +1325,10 @@ class FileDiff(Gtk.Box, MeldDoc):
+                 # shutting down our matcher process.
+                 log.exception('Failed to shut down matcher process')
+             # TODO: Base the return code on something meaningful for VC tools
+-            self.close_signal.emit(0)
++            # Local patch: the anchored merge view reports whether the merge
++            # was saved with nothing unresolved (meld/anchoredview.py).
++            self.close_signal.emit(
++                self.anchored.exit_status() if self.anchored is not None else 0)
+         elif response == Gtk.ResponseType.CANCEL:
+             self.state = ComparisonState.Normal
+         elif response == Gtk.ResponseType.APPLY:
+@@ -1827,6 +1844,10 @@ class FileDiff(Gtk.Box, MeldDoc):
+         self.recompute_label()
+ 
+     def _merge_files(self):
++        # Local patch: base-anchored merge view hook (meld/anchoredview.py)
++        if self.anchored is not None:
++            yield from self.anchored.prepare()
++            return
+         if self.comparison_mode == FileComparisonMode.AutoMerge:
+             yield _("[%s] Merging files") % self.label_text
+             merger = Merger()
+@@ -1844,7 +1865,8 @@ class FileDiff(Gtk.Box, MeldDoc):
+     def _diff_files(self, refresh=False):
+         yield _("[%s] Computing differences") % self.label_text
+         texts = self.buffer_filtered[:self.num_panes]
+-        self.linediffer.ignore_blanks = self.props.ignore_blank_lines
++        self.linediffer.ignore_blanks = (
++            self.props.ignore_blank_lines and self.anchored is None)
+         step = self.linediffer.set_sequences_iter(texts)
+         while next(step) is None:
+             yield 1
+@@ -1919,6 +1941,13 @@ class FileDiff(Gtk.Box, MeldDoc):
+         self.scheduler.add_task(self._diff_files(refresh=True))
+ 
+     def _set_merge_action_sensitivity(self):
++        # Local patch: base-anchored merge view hook (meld/anchoredview.py)
++        # Meld's own merge-all actions copy chunks between panes; the
++        # anchored view has its own toolbar for that.
++        if self.anchored is not None:
++            for name in ('merge-all-left', 'merge-all-right', 'merge-all'):
++                self.set_action_enabled(name, False)
++            return
+         if self.focus_pane:
+             editable = self.focus_pane.get_editable()
+             pane_idx = self.textview.index(self.focus_pane)
+@@ -1949,7 +1978,9 @@ class FileDiff(Gtk.Box, MeldDoc):
+                 child for child in
+                 self.statusbar[1].get_message_area().get_children()
+                 if isinstance(child, Gtk.Label))
+-            count = len(self.linediffer.conflicts)
++            count = (self.anchored.conflict_count()
++                     if self.anchored is not None
++                     else len(self.linediffer.conflicts))
+             if count:
+                 label.set_markup(
+                     f'<span foreground="#f75464" weight="bold">{count} '
+@@ -1969,6 +2000,9 @@ class FileDiff(Gtk.Box, MeldDoc):
+             to_pane = self.textview.index(gutter.target_view)
+             gutter.chunks = list(linediffer.paired_all_single_changes(
+                 from_pane, to_pane))
++        # Local patch: base-anchored merge view hook (meld/anchoredview.py)
++        if self.anchored is not None:
++            self.anchored.on_diffs_changed()
+ 
+         removed_chunks, added_chunks, modified_chunks = chunk_changes
+ 
+@@ -1983,7 +2017,11 @@ class FileDiff(Gtk.Box, MeldDoc):
+ 
+         for chunks in need_clearing:
+             for i, chunk in enumerate(chunks):
+-                if not chunk or not wants_inline_highlight(chunk):
++                # Local patch: clear every removed chunk, not only those
++                # that would be highlighted now. A conflict reshaped by an
++                # edit (one side emptied) no longer qualifies, but still
++                # carries the marks it got before.
++                if not chunk:
+                     continue
+                 to_idx = 2 if i == 1 else 0
+                 bufs = self.textbuffer[1], self.textbuffer[to_idx]
+@@ -1995,11 +2033,20 @@ class FileDiff(Gtk.Box, MeldDoc):
+         for chunks in need_highlighting:
+             clear = chunks == modified_chunks
+             for merge_cache_index, chunk in enumerate(chunks):
+-                if not chunk or not wants_inline_highlight(chunk):
++                if not chunk:
+                     continue
+                 to_pane = 2 if merge_cache_index == 1 else 0
+                 bufs = self.textbuffer[1], self.textbuffer[to_pane]
+                 tags = alltags[1], alltags[to_pane]
++                if not wants_inline_highlight(chunk):
++                    # Local patch: an edited chunk that no longer qualifies
++                    # drops the marks it had (see the clearing loop above).
++                    if clear:
++                        bufs[0].remove_tag(
++                            tags[0], *chunk.to_iters(buffer_a=bufs[0]))
++                        bufs[1].remove_tag(
++                            tags[1], *chunk.to_iters(buffer_b=bufs[1]))
++                    continue
+ 
+                 buf_from_iters = chunk.to_iters(buffer_a=bufs[0])
+                 buf_to_iters = chunk.to_iters(buffer_b=bufs[1])
+@@ -2322,6 +2369,9 @@ class FileDiff(Gtk.Box, MeldDoc):
+         buf.data.update_mtime()
+         if pane == 1 and self.num_panes == 3:
+             self.meta['middle_saved'] = True
++        # Local patch: base-anchored merge view hook (meld/anchoredview.py)
++        if pane == 1 and self.anchored is not None:
++            self.anchored.on_saved()
+ 
+         if self.state == ComparisonState.Closing:
+             if not any(b.get_modified() for b in self.textbuffer):
+diff --git a/meld/matchers/diffutil.py b/meld/matchers/diffutil.py
+index 2fd4208..47c2cde 100644
+--- a/meld/matchers/diffutil.py
++++ b/meld/matchers/diffutil.py
+@@ -29,7 +29,10 @@ opcode_reverse = {
+     "insert": "delete",
+     "delete": "insert",
+     "conflict": "conflict",
+-    "equal": "equal"
++    "equal": "equal",
++    # Local patch: a handled change in the base-anchored merge view
++    # (meld/matchers/anchored.py) looks the same from either side.
++    "resolved": "resolved",
+ }
+ 
+ 
+diff --git a/meld/matchers/words.py b/meld/matchers/words.py
+index 675b001..4752748 100644
+--- a/meld/matchers/words.py
++++ b/meld/matchers/words.py
+@@ -31,9 +31,11 @@ from typing import List, Tuple
+ 
+ from meld.matchers.myers import DiffChunk, MyersSequenceMatcher
+ 
+-# A word, or any single character that is neither a word character nor
+-# whitespace. Whitespace is never a token.
+-TOKEN_RE = re.compile(r"\w+|[^\w\s]")
++# A word, a line break, or any single character that is neither a word
++# character nor whitespace. Line breaks are tokens so that words line up
++# line by line, but a span is never marked for whitespace alone; other
++# whitespace is never a token.
++TOKEN_RE = re.compile(r"\w+|\n|[^\w\s]")
+ 
+ Token = Tuple[str, int, int]
+ 
+@@ -52,6 +54,96 @@ def _char_span(tokens: List[Token], lo: int, hi: int) -> Tuple[int, int]:
+     return pos, pos
+ 
+ 
++def _slide_to_line_starts(opcodes, words_a, words_b):
++    """Move each pure insertion or deletion over identical tokens to where
++    it starts at a line start, or failing that ends with a line break.
++
++    Two placements of the same insertion can be equally short, and Myers
++    may pick one that begins with the previous line's ">" or line break,
++    marking it as part of the new line. Git's diff heuristic does the same
++    sliding for whole lines. Only runs between two equal runs move, and
++    only within them."""
++    for n in range(1, len(opcodes) - 1):
++        tag, i1, i2, j1, j2 = opcodes[n]
++        before, after = opcodes[n - 1], opcodes[n + 1]
++        if before[0] != "equal" or after[0] != "equal":
++            continue
++        if i1 == i2:
++            words, lo, hi = words_b, j1, j2
++            room_up, room_down = before[4] - before[3], after[4] - after[3]
++        elif j1 == j2:
++            words, lo, hi = words_a, i1, i2
++            room_up, room_down = before[2] - before[1], after[2] - after[1]
++        else:
++            continue
++
++        def score(k):
++            # A run that begins with a line break, or right after one,
++            # starts a line once trimmed; likewise at its end.
++            first, last = lo + k, hi + k - 1
++            starts_line = (first == 0 or words[first - 1] == "\n" or
++                           words[first] == "\n")
++            ends_line = (last + 1 == len(words) or words[last + 1] == "\n" or
++                         words[last] == "\n")
++            return 2 * starts_line + ends_line
++
++        best = 0
++        k = 0
++        while -k < room_up and words[lo + k - 1] == words[hi + k - 1]:
++            k -= 1
++            if score(k) > score(best):
++                best = k
++        k = 0
++        while k < room_down and words[lo + k] == words[hi + k]:
++            k += 1
++            if score(k) > score(best):
++                best = k
++        if best:
++            # The run moves by best tokens; the equal runs on either side
++            # shrink or grow to match.
++            before[2] += best
++            before[4] += best
++            opcodes[n] = [tag, i1 + best, i2 + best, j1 + best, j2 + best]
++            after[1] += best
++            after[3] += best
++    return [op for op in opcodes if not (op[0] == "equal" and op[1] == op[2])]
++
++
++def _trim(text: str, start: int, end: int) -> Tuple[int, int]:
++    """A span without whitespace at either end (line breaks included)."""
++    while start < end and text[start].isspace():
++        start += 1
++    while end > start and text[end - 1].isspace():
++        end -= 1
++    return start, end
++
++
++def _line_spans(text: str) -> List[Tuple[int, int]]:
++    """(start, end) of every line, line break excluded."""
++    spans, start = [], 0
++    for line in text.split("\n"):
++        spans.append((start, start + len(line)))
++        start += len(line) + 1
++    return spans
++
++
++def _block_span(text: str, lines: List[Tuple[int, int]],
++                lo: int, hi: int) -> Tuple[int, int]:
++    """Character span of lines[lo:hi] without their outer whitespace, or an
++    empty span where they would start (end of the line before)."""
++    if lo >= hi:
++        pos = lines[lo - 1][1] if lo > 0 else 0
++        return pos, pos
++    start, end = lines[lo][0], lines[hi - 1][1]
++    while start < end and text[start].isspace():
++        start += 1
++    while end > start and text[end - 1].isspace():
++        end -= 1
++    if start == end:
++        return start, start
++    return start, end
++
++
+ def _gap_text(text: str, tokens: List[Token], lo: int, hi: int) -> str:
+     """The text from the end of the token before tokens[lo] to the start of
+     the token after tokens[hi - 1], whitespace included; either end falls
+@@ -86,17 +178,52 @@ class WordSequenceMatcher:
+         self.b = b
+ 
+     def get_opcodes(self) -> List[DiffChunk]:
++        """Lines first, then words: lines are paired by their text without
++        indentation, so lines that only moved or were re-indented mark
++        nothing, new or removed lines are marked whole, and only the lines
++        in a replaced run are compared word by word. Comparing the whole
++        chunk as one stream of words would pair the frequent "<", ">" or
++        quote marks across different lines and scatter marks over lines
++        that did not change."""
++        lines_a, lines_b = _line_spans(self.a), _line_spans(self.b)
++        keys_a = [self.a[s:e].strip() for s, e in lines_a]
++        keys_b = [self.b[s:e].strip() for s, e in lines_b]
++        matcher = MyersSequenceMatcher(None, keys_a, keys_b)
++        chunks = []
++        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
++            if tag == "equal":
++                continue
++            span_a = _block_span(self.a, lines_a, i1, i2)
++            span_b = _block_span(self.b, lines_b, j1, j2)
++            if tag != "replace":
++                if span_a[0] != span_a[1] or span_b[0] != span_b[1]:
++                    chunks.append(DiffChunk(tag, *span_a, *span_b))
++                continue
++            sub = WordSequenceMatcher(
++                None, self.a[span_a[0]:span_a[1]], self.b[span_b[0]:span_b[1]])
++            for c in sub._word_opcodes():
++                chunks.append(DiffChunk(
++                    c.tag, c.start_a + span_a[0], c.end_a + span_a[0],
++                    c.start_b + span_b[0], c.end_b + span_b[0]))
++        return chunks
++
++    def _word_opcodes(self) -> List[DiffChunk]:
+         tokens_a = tokenise(self.a)
+         tokens_b = tokenise(self.b)
+         matcher = MyersSequenceMatcher(
+             None, [t[0] for t in tokens_a], [t[0] for t in tokens_b])
+-        opcodes = matcher.get_opcodes()
++        words_a = [t[0] for t in tokens_a]
++        words_b = [t[0] for t in tokens_b]
++        opcodes = _slide_to_line_starts(
++            [list(op) for op in matcher.get_opcodes()], words_a, words_b)
+         chunks = []
+         for n, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+             if tag == "equal":
+                 continue
+-            start_a, end_a = _char_span(tokens_a, i1, i2)
+-            start_b, end_b = _char_span(tokens_b, j1, j2)
++            start_a, end_a = _trim(self.a, *_char_span(tokens_a, i1, i2))
++            start_b, end_b = _trim(self.b, *_char_span(tokens_b, j1, j2))
++            if start_a == end_a and start_b == end_b:
++                continue  # only line breaks changed
+             if chunks and self._bridges(opcodes[n - 1], tokens_a, tokens_b):
+                 # Join this change to the previous one across the
+                 # punctuation between them, so one edit reads as one span.
+diff --git a/meld/meldapp.py b/meld/meldapp.py
+index 02f36d5..13faec6 100644
+--- a/meld/meldapp.py
++++ b/meld/meldapp.py
+@@ -92,6 +92,13 @@ class MeldApp(Gtk.Application):
+             def done(tab, status):
+                 self.release()
+                 tab.command_line.set_exit_status(status)
++                # Local patch: GApplication drops a local command line's
++                # exit status once the main loop has run, so the first
++                # Meld instance always exited 0. Keep the worst status for
++                # bin/meld to return (git mergetool's trustExitCode reads
++                # it; meld/anchoredview.py sets it).
++                self.local_exit_status = max(
++                    getattr(self, 'local_exit_status', 0), status)
+                 tab.command_line = None
+ 
+             self.hold()
+@@ -274,6 +281,11 @@ class MeldApp(Gtk.Application):
+         parser.add_option(
+             "--auto-merge", None, action="store_true", default=False,
+             help=_("Automatically merge files"))
++        # Local patch: PhpStorm-style merge view (meld/anchoredview.py).
++        parser.add_option(
++            "--anchored-merge", None, action="store_true", default=False,
++            help="Merge LOCAL BASE REMOTE change by change, starting from "
++                 "the base (local patch)")
+         parser.add_option(
+             "", "--comparison-file", action="store", type="string",
+             dest="comparison_file", default=None,
+@@ -303,9 +315,10 @@ class MeldApp(Gtk.Application):
+         if len(args) > 3:
+             parser.local_error(_("too many arguments (wanted 0-3, got %d)") %
+                                len(args))
+-        elif options.auto_merge and len(args) < 3:
++        elif (options.auto_merge or options.anchored_merge) and len(args) < 3:
+             parser.local_error(_("can’t auto-merge less than 3 files"))
+-        elif options.auto_merge and any([os.path.isdir(f) for f in args]):
++        elif (options.auto_merge or options.anchored_merge) and any(
++                [os.path.isdir(f) for f in args]):
+             parser.local_error(_("can’t auto-merge directories"))
+ 
+         if parser.should_exit:
+@@ -380,7 +393,8 @@ class MeldApp(Gtk.Application):
+             close_on_error = True
+ 
+         for i, paths in enumerate(comparisons):
+-            auto_merge = options.auto_merge and i == 0
++            auto_merge = (
++                options.auto_merge or options.anchored_merge) and i == 0
+             try:
+                 files = [make_file_from_command_line(p) for p in paths]
+                 tab = self.open_files(
+@@ -389,6 +403,7 @@ class MeldApp(Gtk.Application):
+                     close_on_error=close_on_error,
+                     auto_compare=options.auto_compare,
+                     auto_merge=auto_merge,
++                    anchored_merge=options.anchored_merge and i == 0,
+                     focus=i == 0,
+                 )
+             except ValueError as err:
+diff --git a/meld/meldwindow.py b/meld/meldwindow.py
+index 52b17ee..d1ab4d8 100644
+--- a/meld/meldwindow.py
++++ b/meld/meldwindow.py
+@@ -391,13 +391,15 @@ class MeldWindow(Gtk.ApplicationWindow):
+             doc.set_meta(meta)
+         return doc
+ 
+-    def append_filemerge(self, gfiles, merge_output=None):
++    def append_filemerge(self, gfiles, merge_output=None, anchored=False):
+         if len(gfiles) != 3:
+             raise ValueError(
+                 _("Need three files to auto-merge, got: %r") %
+                 [f.get_parse_name() for f in gfiles])
+-        doc = FileDiff(
+-            len(gfiles), comparison_mode=FileComparisonMode.AutoMerge)
++        # Local patch: anchored selects the PhpStorm-style merge view.
++        mode = (FileComparisonMode.AnchoredMerge if anchored
++                else FileComparisonMode.AutoMerge)
++        doc = FileDiff(len(gfiles), comparison_mode=mode)
+         self._append_page(doc)
+         doc.set_files(gfiles)
+         if merge_output is not None:
+@@ -410,6 +412,7 @@ class MeldWindow(Gtk.ApplicationWindow):
+         auto_compare: bool = False,
+         auto_merge: bool = False,
+         merge_output: Optional[Gio.File] = None,
++        anchored_merge: bool = False,
+         meta: Optional[Dict[str, Any]] = None,
+     ):
+         have_directories = False
+@@ -428,7 +431,8 @@ class MeldWindow(Gtk.ApplicationWindow):
+         elif have_directories:
+             return self.append_dirdiff(gfiles, auto_compare)
+         elif auto_merge:
+-            return self.append_filemerge(gfiles, merge_output=merge_output)
++            return self.append_filemerge(
++                gfiles, merge_output=merge_output, anchored=anchored_merge)
+         else:
+             return self.append_filediff(
+                 gfiles, merge_output=merge_output, meta=meta)
+@@ -473,7 +477,7 @@ class MeldWindow(Gtk.ApplicationWindow):
+         doc.run_diff(path)
+ 
+     def open_paths(self, gfiles, auto_compare=False, auto_merge=False,
+-                   focus=False):
++                   focus=False, anchored_merge=False):
+         tab = None
+         if len(gfiles) == 1:
+             gfile = gfiles[0]
+@@ -490,7 +494,8 @@ class MeldWindow(Gtk.ApplicationWindow):
+ 
+         elif len(gfiles) in (2, 3):
+             tab = self.append_diff(gfiles, auto_compare=auto_compare,
+-                                   auto_merge=auto_merge)
++                                   auto_merge=auto_merge,
++                                   anchored_merge=anchored_merge)
+         if tab:
+             recent_comparisons.add(tab)
+             if focus:
+diff --git a/meld/style.py b/meld/style.py
+index 281a340..8ce32bd 100644
+--- a/meld/style.py
++++ b/meld/style.py
+@@ -113,6 +113,8 @@ def get_common_theme() -> Tuple[ColourMap, ColourMap]:
+         "conflict": lookup("meld:conflict", "background"),
+         "replace": lookup("meld:replace", "background"),
+         "error": lookup("meld:error", "background"),
++        # Local patch: a handled change in the base-anchored merge view.
++        "resolved": lookup("meld:resolved", "background"),
+         "focus-highlight": lookup("meld:current-line-highlight", "foreground"),
+         "current-chunk-highlight": lookup(
+             "meld:current-chunk-highlight", "background"),
+@@ -124,5 +126,6 @@ def get_common_theme() -> Tuple[ColourMap, ColourMap]:
+         "conflict": lookup("meld:conflict", "line-background"),
+         "replace": lookup("meld:replace", "line-background"),
+         "error": lookup("meld:error", "line-background"),
++        "resolved": lookup("meld:resolved", "line-background"),
+     }
+     return fill_colours, line_colours
+diff --git a/test/test_anchored.py b/test/test_anchored.py
+index 9c875ac..e7221bc 100644
+--- a/test/test_anchored.py
++++ b/test/test_anchored.py
+@@ -370,6 +370,13 @@ class DifferTests(unittest.TestCase):
+         right_chunks = [p[1] for p in d.all_changes() if p[1] is not None]
+         self.assertIn('resolved', [c.tag for c in right_chunks])
+         self.assertEqual(self.tags(d, LEFT), ['insert', 'conflict'])
++        # Every view of the chunks Meld's drawing code reads must accept
++        # the new tag (it reverses chunks for the side panes).
++        for pane in range(3):
++            list(d.single_changes(pane))
++        for a, b in ((0, 1), (1, 0), (1, 2), (2, 1)):
++            list(d.pair_changes(a, b))
++            list(d.paired_all_single_changes(a, b))
+ 
+     def test_every_difference_keeps_a_chunk(self):
+         d = self.make(LEFT_T, BASE, RIGHT_T)
+diff --git a/test/test_words.py b/test/test_words.py
+index 9dfa35b..60d57ab 100644
+--- a/test/test_words.py
++++ b/test/test_words.py
+@@ -24,10 +24,10 @@ def marked(a, b):
+ 
+ class WordMatcherTests(unittest.TestCase):
+ 
+-    def test_tokenise_skips_whitespace(self):
++    def test_tokenise_skips_spaces_but_keeps_line_breaks(self):
+         self.assertEqual(
+             [t[0] for t in tokenise("  foo(bar, 1)\n")],
+-            ["foo", "(", "bar", ",", "1", ")"])
++            ["foo", "(", "bar", ",", "1", ")", "\n"])
+ 
+     def test_identical_text_marks_nothing(self):
+         self.assertEqual(marked("a b c", "a b c"), [])
+@@ -76,6 +76,24 @@ class WordMatcherTests(unittest.TestCase):
+         self.assertEqual(marked("? x", "y ? x z"), [("", "y"), ("", "z")])
+         self.assertEqual(marked("a ?", "? b ?"), [("a", "? b")])
+ 
++    def test_lines_that_only_moved_or_reindented_mark_nothing(self):
++        # A block wrapped in a new element: only the wrapper lines are new.
++        a = ("<Container className={cn('flex py-10')}>\n"
++             "  <Heading level={1}>\n"
++             "    {heading}\n"
++             "  </Heading>\n")
++        b = ("<Container className={cn('py-10')}>\n"
++             "  <div className=\"min-w-0\">\n"
++             "    <Heading level={1}>\n"
++             "      {heading}\n"
++             "    </Heading>\n"
++             "  </div>\n")
++        self.assertEqual(marked(a, b), [
++            ("flex", ""),
++            ("", "<div className=\"min-w-0\">"),
++            ("", "</div>"),
++        ])
++
+     def test_offsets_are_characters_not_bytes(self):
+         a = "τίτλος old"
+         b = "τίτλος new"
+-- 
+2.43.0
+

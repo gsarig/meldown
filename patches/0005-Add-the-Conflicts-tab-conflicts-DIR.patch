@@ -1,0 +1,846 @@
+From 1bff45a694a7d117aec4d3f70625822890fd260a Mon Sep 17 00:00:00 2001
+From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
+Date: Thu, 12 Nov 2026 01:24:56 +0200
+Subject: [PATCH 5/5] Add the Conflicts tab (--conflicts DIR)
+
+PhpStorm's Conflicts dialog as a Meld tab: every conflicted file of a git
+repository, grouped Unresolved, Auto-resolved and Resolved, with Yours
+and Theirs status and an Accept button per side (that side's version
+staged, or its deletion for a side that deleted the file).
+
+Double-click or Merge opens a file in the anchored merge view, in a tab
+of its own, whose bottom button becomes Save and back to list; saving
+with nothing unresolved stages the file. Resolve all simple conflicts
+merges every file without a real conflict, word by word, keeping each
+file's line breaks, and leaves it unstaged under Auto-resolved for
+review; Accept and finish stages those and closes Meld. Deleted-on-one-
+side and binary files offer only Accept.
+
+Column titles and the header come from MELD_CONFLICTS_YOURS, _THEIRS and
+_HEADER, set by the wrapper that knows the branch names.
+---
+ meld/anchoredview.py   |  15 +-
+ meld/conflicts.py      | 121 +++++++++++
+ meld/conflictsview.py  | 451 +++++++++++++++++++++++++++++++++++++++++
+ meld/meldapp.py        |  16 ++
+ meld/meldwindow.py     |   9 +
+ test/test_conflicts.py | 120 +++++++++++
+ 6 files changed, 729 insertions(+), 3 deletions(-)
+ create mode 100644 meld/conflicts.py
+ create mode 100644 meld/conflictsview.py
+ create mode 100644 test/test_conflicts.py
+
+diff --git a/meld/anchoredview.py b/meld/anchoredview.py
+index a41ac53..be7877d 100644
+--- a/meld/anchoredview.py
++++ b/meld/anchoredview.py
+@@ -75,6 +75,9 @@ class AnchoredView:
+         self.saved_resolved = False
+         self.edited_since_save = True
+         self._close_after_save = False
++        self._confirm_text = ('If you save and close now, the file stays '
++                              'unresolved and git mergetool will ask '
++                              'whether to go on to the next file.')
+         self._build_toolbars()
+         for side, index in GUTTERS.items():
+             gutter = filediff.actiongutter[index]
+@@ -138,6 +141,7 @@ class AnchoredView:
+             'Save the result and close it; Ctrl+S saves without closing')
+         save.connect('clicked', lambda *args: self.save_and_close())
+         bottom.pack_end(save)
++        self.save_button = save
+         self.bottom = bottom
+ 
+         self.fd.pack_start(top, False, False, 0)
+@@ -194,6 +198,13 @@ class AnchoredView:
+             self._close_after_save = False
+             GLib.idle_add(self._close)
+ 
++    def set_from_list(self):
++        """Opened from the Conflicts tab (meld/conflictsview.py): closing
++        returns to the list, which stages the file once it is resolved."""
++        self.save_button.set_label('Save and back to list')
++        self._confirm_text = ('If you save and go back now, the file stays '
++                              'unresolved in the list.')
++
+     def save_and_close(self):
+         """Save the result, then close: the whole window when this is its
+         only tab (git mergetool waits for Meld to exit before the next
+@@ -210,9 +221,7 @@ class AnchoredView:
+     def _confirm_unresolved(self, unresolved: int) -> bool:
+         primary = (f'{unresolved} change{"s are" if unresolved != 1 else " is"}'
+                    ' still unresolved')
+-        secondary = ('If you save and close now, the file stays unresolved '
+-                     'and git mergetool will ask whether to go on to the '
+-                     'next file.')
++        secondary = self._confirm_text
+         response = misc.modal_dialog(
+             primary, secondary,
+             (('_Keep resolving', Gtk.ResponseType.CANCEL, None),
+diff --git a/meld/conflicts.py b/meld/conflicts.py
+new file mode 100644
+index 0000000..993fd78
+--- /dev/null
++++ b/meld/conflicts.py
+@@ -0,0 +1,121 @@
++# Copyright (C) 2026 Giorgos Sarigiannidis
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 2 of the License, or (at
++# your option) any later version.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++"""Git and text helpers for the Conflicts tab (local patch, not upstream).
++
++Kept free of GTK so they can be tested on their own; the tab itself is
++meld/conflictsview.py.
++
++Stages follow git's index: 1 is the common base, 2 "ours" (the side
++shown on the left, "yours"), 3 "theirs" (the right). In a rebase git
++swaps what ours and theirs mean; the wrapper script names the columns.
++"""
++
++import os
++import subprocess
++from typing import Dict, List, Optional, Set, Tuple
++
++from meld.matchers.anchored import AnchoredMerge, apply_edits
++
++BASE, OURS, THEIRS = 1, 2, 3
++BINARY_PROBE = 8192
++
++
++def git(repo: str, *args: str, input: Optional[bytes] = None) -> bytes:
++    """Run git in repo and return its stdout; raises CalledProcessError."""
++    return subprocess.run(
++        ['git', *args], cwd=repo, input=input, check=True,
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
++
++
++def parse_unmerged(output: bytes) -> Dict[str, Set[int]]:
++    """Paths and the stages they have, from `git ls-files -u -z`."""
++    paths: Dict[str, Set[int]] = {}
++    for record in output.split(b'\0'):
++        if not record:
++            continue
++        info, _tab, path = record.partition(b'\t')
++        stage = int(info.split()[2])
++        paths.setdefault(os.fsdecode(path), set()).add(stage)
++    return paths
++
++
++def unmerged(repo: str) -> Dict[str, Set[int]]:
++    return parse_unmerged(git(repo, 'ls-files', '-u', '-z'))
++
++
++def side_status(stages: Set[int], stage: int) -> str:
++    """How one side changed the file: Modified, Added or Deleted."""
++    if stage not in stages:
++        return 'Deleted'
++    return 'Modified' if BASE in stages else 'Added'
++
++
++def is_binary(data: bytes) -> bool:
++    return b'\0' in data[:BINARY_PROBE]
++
++
++def stage_bytes(repo: str, path: str, stage: int) -> bytes:
++    return git(repo, 'show', f':{stage}:{path}')
++
++
++def mergeable(stages: Set[int], contents: Dict[int, bytes]) -> bool:
++    """Whether the file can open in the merge view: both sides exist (a
++    side that deleted the file leaves only Accept) and neither is binary."""
++    if OURS not in stages or THEIRS not in stages:
++        return False
++    return not any(is_binary(contents.get(s, b'')) for s in (OURS, THEIRS))
++
++
++def split_text(text: str) -> Tuple[List[str], str]:
++    """Lines as Meld's buffers give them (no line endings, a final empty
++    line after a trailing line break) and the line break the text uses."""
++    newline = '\r\n' if '\r\n' in text else '\n'
++    return [line.rstrip('\r') for line in text.split('\n')], newline
++
++
++def join_lines(lines: List[str], newline: str) -> str:
++    return newline.join(lines)
++
++
++def decode(data: bytes) -> Optional[str]:
++    """Text of a stage, or None when it is not UTF-8 (such files are left
++    for the merge view, which knows more encodings)."""
++    try:
++        return data.decode('utf-8')
++    except UnicodeDecodeError:
++        return None
++
++
++def auto_resolve(contents: Dict[int, bytes]) -> Optional[bytes]:
++    """The whole file merged without a person: every non-conflicting change
++    applied and every conflict through the magic wand, or None when
++    anything is left. The result keeps the "ours" side's line breaks and is
++    written back as UTF-8, the encoding all three stages decoded from."""
++    texts = {s: decode(contents.get(s, b'')) for s in (BASE, OURS, THEIRS)}
++    if any(t is None for t in texts.values()):
++        return None
++    left, newline = split_text(texts[OURS])
++    base, _ = split_text(texts[BASE])
++    right, _ = split_text(texts[THEIRS])
++
++    model = AnchoredMerge(left, base, right)
++    result = apply_edits(list(model.result), model.apply_non_conflicting('all'))
++    model = AnchoredMerge(left, base, right, result)
++    result = apply_edits(result, model.wand_all())
++    model = AnchoredMerge(left, base, right, result)
++    if model.counts()[1]:
++        return None
++    return join_lines(result, newline).encode('utf-8')
+diff --git a/meld/conflictsview.py b/meld/conflictsview.py
+new file mode 100644
+index 0000000..3d5c90b
+--- /dev/null
++++ b/meld/conflictsview.py
+@@ -0,0 +1,451 @@
++# Copyright (C) 2026 Giorgos Sarigiannidis
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 2 of the License, or (at
++# your option) any later version.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++"""The Conflicts tab (local patch, not upstream Meld).
++
++`meld --conflicts DIR` opens this tab, PhpStorm's Conflicts dialog in a
++Meld tab: every conflicted file of the repo, its Yours and Theirs status
++with an Accept button each, Resolve all simple conflicts, and Accept and
++finish. A file opens in the anchored merge view (meld/anchoredview.py) in
++a tab of its own; saving it with nothing unresolved stages it and brings
++the list back.
++
++The column titles and the header come from the wrapper script through
++MELD_CONFLICTS_YOURS, MELD_CONFLICTS_THEIRS and MELD_CONFLICTS_HEADER, so
++the branch naming (which flips in a rebase) lives in one place.
++"""
++
++import atexit
++import logging
++import os
++import shutil
++import subprocess
++import tempfile
++from typing import Dict, Optional, Set
++
++from gi.repository import Gio, GLib, Gtk, Pango
++
++from meld import misc
++from meld.conflicts import (
++    BASE,
++    OURS,
++    THEIRS,
++    auto_resolve,
++    git,
++    mergeable,
++    side_status,
++    stage_bytes,
++    unmerged,
++)
++from meld.melddoc import MeldDoc
++from meld.recent import RecentType
++
++log = logging.getLogger(__name__)
++
++STATUS_WIDTH = 110
++BUTTON_WIDTH = 90
++
++
++def _dim(text: str) -> str:
++    return f'<span alpha="60%">{GLib.markup_escape_text(text)}</span>'
++
++
++class ConflictsView(Gtk.Box, MeldDoc):
++
++    __gtype_name__ = 'ConflictsView'
++
++    # A GObject subclass of two GObject bases only gets the first base's
++    # signals, so MeldDoc's are declared again, as FileDiff does.
++    close_signal = MeldDoc.close_signal
++    create_diff_signal = MeldDoc.create_diff_signal
++    file_changed_signal = MeldDoc.file_changed_signal
++    label_changed = MeldDoc.label_changed
++    move_diff = MeldDoc.move_diff
++    tab_state_changed = MeldDoc.tab_state_changed
++
++    def __init__(self, window, repo: str):
++        super().__init__(orientation=Gtk.Orientation.VERTICAL)
++        # Same workaround as FileDiff: GObject does not chain this init.
++        MeldDoc.__init__(self)
++        self.window = window
++        self.repo = repo
++        self.label_text = 'Conflicts'
++        self.tooltip_text = repo
++        self.yours = os.environ.get('MELD_CONFLICTS_YOURS') or 'Yours'
++        self.theirs = os.environ.get('MELD_CONFLICTS_THEIRS') or 'Theirs'
++        self.header = os.environ.get('MELD_CONFLICTS_HEADER') or ''
++        self.tmpdir = tempfile.mkdtemp(prefix='meld-conflicts-')
++        atexit.register(shutil.rmtree, self.tmpdir, True)
++        self._opened = 0
++
++        try:
++            self.initial = set(unmerged(repo))
++        except (OSError, subprocess.CalledProcessError) as err:
++            self.initial = set()
++            log.error('Cannot read conflicts in %s: %s', repo, err)
++        self.current: Dict[str, Set[int]] = {}
++        self.auto: Set[str] = set()       # written by the wand, not staged
++        self.outcome: Dict[str, str] = {}  # how a resolved file was done
++        self.tabs: Dict[str, object] = {}  # path -> its merge FileDiff
++        self.finished = False
++
++        self._build()
++        self.show_all()
++        self.refresh()
++
++    # -- MeldDoc ---------------------------------------------------------------
++
++    def get_comparison(self):
++        return RecentType.VersionControl, [Gio.File.new_for_path(self.repo)]
++
++    def next_diff(self, direction):
++        pass
++
++    def on_container_switch_in_event(self, window):
++        super().on_container_switch_in_event(window)
++        self.refresh()
++
++    def on_delete_event(self):
++        self.scheduler.remove_all_tasks()
++        self.close_signal.emit(self.exit_status())
++        return Gtk.ResponseType.OK
++
++    def exit_status(self) -> int:
++        if self.finished:
++            return 0
++        return 1 if self._unresolved() or self._pending_auto() else 0
++
++    # -- layout ----------------------------------------------------------------
++
++    def _build(self):
++        self.props.margin = 16
++        self.props.spacing = 12
++
++        header = Gtk.Label(xalign=0)
++        header.set_line_wrap(True)
++        header.set_markup(self.header or GLib.markup_escape_text(self.repo))
++        self.pack_start(header, False, False, 0)
++
++        top = Gtk.Box(spacing=8)
++        self.simple_button = Gtk.Button.new_with_label(
++            '✨ Resolve all simple conflicts')
++        self.simple_button.set_tooltip_text(
++            'Merge every file whose changes do not overlap, word by word; '
++            'they go to Auto-resolved for review')
++        self.simple_button.connect('clicked', lambda *a: self.resolve_simple())
++        top.pack_start(self.simple_button, False, False, 0)
++        self.pack_start(top, False, False, 0)
++
++        self.listbox = Gtk.ListBox()
++        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
++        self.listbox.set_activate_on_single_click(False)
++        self.listbox.connect('row-activated', self.on_row_activated)
++        self.listbox.connect('row-selected', lambda *a: self._update_buttons())
++        scroller = Gtk.ScrolledWindow()
++        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
++        scroller.add(self.listbox)
++        frame = Gtk.Frame()
++        frame.add(scroller)
++        self.pack_start(frame, True, True, 0)
++
++        bottom = Gtk.Box(spacing=8)
++        self.hint = Gtk.Label(xalign=0)
++        self.hint.get_style_context().add_class('dim-label')
++        self.hint.set_ellipsize(Pango.EllipsizeMode.END)
++        bottom.pack_start(self.hint, True, True, 0)
++        close = Gtk.Button.new_with_label('Close')
++        close.connect('clicked', lambda *a: self.window.close())
++        self.finish_button = Gtk.Button.new_with_label('Accept and finish')
++        self.finish_button.set_tooltip_text(
++            'Stage the auto-resolved files and close Meld')
++        self.finish_button.connect('clicked', lambda *a: self.finish())
++        self.merge_button = Gtk.Button.new_with_label('Merge')
++        self.merge_button.get_style_context().add_class('suggested-action')
++        self.merge_button.connect('clicked', lambda *a: self.open_selected())
++        for button in (close, self.finish_button, self.merge_button):
++            bottom.pack_end(button, False, False, 0)
++        self.bottom_buttons = (close, self.finish_button, self.merge_button)
++        self.pack_start(bottom, False, False, 0)
++
++    def _cell(self, widget, width=None):
++        if width:
++            widget.set_size_request(width, -1)
++        return widget
++
++    def _row(self, children, selectable=True, path=None, css=None):
++        row = Gtk.ListBoxRow()
++        row.set_selectable(selectable)
++        row.set_activatable(selectable)
++        row.path = path
++        box = Gtk.Box(spacing=8)
++        box.props.margin = 6
++        for widget, expand in children:
++            box.pack_start(widget, expand, expand, 0)
++        row.add(box)
++        if css:
++            row.get_style_context().add_class(css)
++        self.listbox.add(row)
++        return row
++
++    def _label(self, markup, width=None, xalign=0.0):
++        label = Gtk.Label(xalign=xalign)
++        label.set_markup(markup)
++        label.set_ellipsize(Pango.EllipsizeMode.END)
++        return self._cell(label, width)
++
++    def _accept_button(self, path, stage):
++        button = Gtk.Button.new_with_label('Accept')
++        button.connect('clicked', lambda *a: self.accept(path, stage))
++        return self._cell(button, BUTTON_WIDTH)
++
++    def _group(self, mark, title, count, note=''):
++        text = f'{mark} <b>{GLib.markup_escape_text(title)}</b> '
++        text += _dim(f'{count} file{"s" if count != 1 else ""}')
++        if note:
++            text += '  ' + _dim(note)
++        self._row([(self._label(text), True)], selectable=False)
++
++    def _file_label(self, path, mark):
++        folder, name = os.path.split(path)
++        text = f'{mark}  {GLib.markup_escape_text(name)}'
++        if folder:
++            text += '  ' + _dim(folder)
++        return self._label(text)
++
++    # -- state -----------------------------------------------------------------
++
++    def _unresolved(self):
++        return sorted(p for p in self.current if p not in self.auto)
++
++    def _pending_auto(self):
++        return sorted(p for p in self.auto if p in self.current)
++
++    def refresh(self):
++        try:
++            self.current = unmerged(self.repo)
++        except (OSError, subprocess.CalledProcessError) as err:
++            log.error('Cannot read conflicts in %s: %s', self.repo, err)
++            return
++        selected = self.listbox.get_selected_row()
++        selected = getattr(selected, 'path', None)
++        for child in self.listbox.get_children():
++            self.listbox.remove(child)
++
++        self._row([
++            (self._label(_dim('File')), True),
++            (self._label(_dim(self.yours), STATUS_WIDTH + BUTTON_WIDTH + 8), False),
++            (self._label(_dim(self.theirs), STATUS_WIDTH + BUTTON_WIDTH + 8), False),
++        ], selectable=False)
++
++        unresolved = self._unresolved()
++        self._group('<span foreground="#f75464">✕</span>', 'Unresolved',
++                    len(unresolved))
++        for path in unresolved:
++            stages = self.current[path]
++            cells = [(self._file_label(path, ''), True)]
++            for stage in (OURS, THEIRS):
++                cells.append((self._label(side_status(stages, stage), STATUS_WIDTH), False))
++                cells.append((self._accept_button(path, stage), False))
++            self._row(cells, path=path)
++
++        auto = self._pending_auto()
++        if auto:
++            self._group('<span foreground="#e5c07b">✨</span>', 'Auto-resolved',
++                        len(auto), 'open one to check it; Accept and finish stages them')
++            for path in auto:
++                self._row([(self._file_label(path, ''), True),
++                           (self._label(_dim('merged, not staged yet')), False)],
++                          path=path)
++
++        resolved = sorted(p for p in self.initial if p not in self.current)
++        self._group('<span foreground="#6aab73">✓</span>', 'Resolved', len(resolved))
++        for path in resolved:
++            self._row([(self._file_label(path, ''), True),
++                       (self._label(_dim(self.outcome.get(path, 'resolved'))), False)],
++                      selectable=False)
++
++        self.listbox.show_all()
++        for row in self.listbox.get_children():
++            if getattr(row, 'path', None) and row.path == selected:
++                self.listbox.select_row(row)
++                break
++        else:
++            first = next((r for r in self.listbox.get_children()
++                          if getattr(r, 'path', None)), None)
++            if first is not None:
++                self.listbox.select_row(first)
++        self._update_buttons()
++
++    def _update_buttons(self):
++        row = self.listbox.get_selected_row()
++        path = getattr(row, 'path', None)
++        self.merge_button.set_sensitive(bool(path) and self._can_merge(path))
++        self.finish_button.set_sensitive(not self._unresolved())
++        if self._unresolved():
++            self.hint.set_text('Double-click a file to merge it')
++        elif self._pending_auto():
++            self.hint.set_text('Nothing left to resolve; Accept and finish '
++                               'stages the auto-resolved files')
++        else:
++            self.hint.set_text('All conflicts resolved')
++
++    def _contents(self, path):
++        stages = self.current.get(path, set())
++        return stages, {s: stage_bytes(self.repo, path, s) for s in stages}
++
++    def _can_merge(self, path):
++        try:
++            stages, contents = self._contents(path)
++        except (OSError, subprocess.CalledProcessError):
++            return False
++        return mergeable(stages, contents)
++
++    def _error(self, primary, err):
++        detail = getattr(err, 'stderr', b'') or str(err)
++        if isinstance(detail, bytes):
++            detail = detail.decode('utf-8', 'replace')
++        misc.error_dialog(primary=primary,
++                          secondary=GLib.markup_escape_text(detail.strip()))
++
++    # -- actions ---------------------------------------------------------------
++
++    def on_row_activated(self, listbox, row):
++        if getattr(row, 'path', None):
++            self.open_merge(row.path)
++
++    def open_selected(self):
++        row = self.listbox.get_selected_row()
++        if getattr(row, 'path', None):
++            self.open_merge(row.path)
++
++    def open_merge(self, path):
++        """Open a file in the anchored merge view, in a tab of its own, or
++        switch to its tab when it is open already."""
++        tab = self.tabs.get(path)
++        notebook = self.window.notebook
++        if tab is not None and notebook.page_num(tab) >= 0:
++            notebook.set_current_page(notebook.page_num(tab))
++            return
++        try:
++            stages, contents = self._contents(path)
++        except (OSError, subprocess.CalledProcessError) as err:
++            self._error(f'Could not read the versions of {path}', err)
++            return
++        if not mergeable(stages, contents):
++            misc.error_dialog(
++                primary=f'{path} cannot be merged here',
++                secondary='One side deleted it or it is binary; use its '
++                          'Accept buttons instead.')
++            return
++        self._opened += 1
++        name = os.path.basename(path)
++        files = []
++        for stage in (OURS, BASE, THEIRS):
++            temp = os.path.join(self.tmpdir, f'{self._opened}-{stage}-{name}')
++            with open(temp, 'wb') as handle:
++                handle.write(contents.get(stage, b''))
++            files.append(Gio.File.new_for_path(temp))
++        output = Gio.File.new_for_path(os.path.join(self.repo, path))
++        doc = self.window.append_filemerge(
++            files, merge_output=output, anchored=True)
++        doc.set_labels([self.yours, f'Result: {path}', self.theirs])
++        doc.anchored.set_from_list()
++        doc.close_signal.connect(
++            lambda _doc, status: self.on_merge_closed(path, status))
++        self.tabs[path] = doc
++        notebook.set_current_page(notebook.page_num(doc))
++
++    def on_merge_closed(self, path, status):
++        """A merge tab closed: status 0 means it was saved with nothing
++        unresolved, so the file is staged."""
++        self.tabs.pop(path, None)
++        if status == 0:
++            try:
++                git(self.repo, 'add', '--', path)
++                self.outcome[path] = 'merged'
++                self.auto.discard(path)
++            except (OSError, subprocess.CalledProcessError) as err:
++                self._error(f'Could not stage {path}', err)
++        notebook = self.window.notebook
++        if notebook.page_num(self) >= 0:
++            notebook.set_current_page(notebook.page_num(self))
++        self.refresh()
++
++    def accept(self, path, stage):
++        """Take one side's whole file: its version (or its deletion) is
++        staged, with no merge view."""
++        stages = self.current.get(path, set())
++        tab = self.tabs.get(path)
++        if tab is not None and self.window.notebook.page_num(tab) >= 0:
++            if tab.on_delete_event() != Gtk.ResponseType.OK:
++                return
++        side = '--ours' if stage == OURS else '--theirs'
++        try:
++            if stage in stages:
++                git(self.repo, 'checkout', side, '--', path)
++                git(self.repo, 'add', '--', path)
++            else:
++                git(self.repo, 'rm', '-q', '--', path)
++        except (OSError, subprocess.CalledProcessError) as err:
++            self._error(f'Could not accept {path}', err)
++            return
++        who = self.yours if stage == OURS else self.theirs
++        self.outcome[path] = f'took {who}'
++        self.auto.discard(path)
++        self.refresh()
++
++    def resolve_simple(self):
++        """Merge every unresolved file that has no real conflict, word by
++        word, and move it to Auto-resolved without staging it."""
++        done = 0
++        for path in self._unresolved():
++            if path in self.tabs:
++                continue
++            try:
++                stages, contents = self._contents(path)
++            except (OSError, subprocess.CalledProcessError):
++                continue
++            if not mergeable(stages, contents):
++                continue
++            contents.setdefault(BASE, b'')
++            merged = auto_resolve(contents)
++            if merged is None:
++                continue
++            try:
++                with open(os.path.join(self.repo, path), 'wb') as handle:
++                    handle.write(merged)
++            except OSError as err:
++                self._error(f'Could not write {path}', err)
++                continue
++            self.auto.add(path)
++            done += 1
++        self.refresh()
++        if not done:
++            self.hint.set_text('No file could be merged without you')
++
++    def finish(self):
++        """Stage the auto-resolved files and close Meld."""
++        for path in self._pending_auto():
++            try:
++                git(self.repo, 'add', '--', path)
++                self.outcome[path] = 'auto-resolved'
++            except (OSError, subprocess.CalledProcessError) as err:
++                self._error(f'Could not stage {path}', err)
++                return
++        self.finished = True
++        self.window.close()
++
++
++ConflictsView.set_css_name('conflicts-view')
+diff --git a/meld/meldapp.py b/meld/meldapp.py
+index 13faec6..29f3a49 100644
+--- a/meld/meldapp.py
++++ b/meld/meldapp.py
+@@ -286,6 +286,12 @@ class MeldApp(Gtk.Application):
+             "--anchored-merge", None, action="store_true", default=False,
+             help="Merge LOCAL BASE REMOTE change by change, starting from "
+                  "the base (local patch)")
++        # Local patch: the Conflicts tab (meld/conflictsview.py).
++        parser.add_option(
++            "", "--conflicts", action="store", type="string",
++            dest="conflicts", default=None,
++            help="List the merge conflicts of the git repository at DIR, "
++                 "PhpStorm style (local patch)")
+         parser.add_option(
+             "", "--comparison-file", action="store", type="string",
+             dest="comparison_file", default=None,
+@@ -325,6 +331,16 @@ class MeldApp(Gtk.Application):
+             cleanup()
+             return parser.exit_status
+ 
++        if options.conflicts:
++            # Local patch: one Conflicts tab for the repository.
++            repo = os.path.join(
++                command_line.get_cwd() or '',
++                os.path.expanduser(options.conflicts))
++            window = self.get_active_window()
++            if command_line.get_is_remote() and not options.newtab:
++                window = self.new_window()
++            return window.append_conflictsview(os.path.abspath(repo))
++
+         if options.comparison_file or (len(args) == 1 and
+                                        args[0].endswith(".meldcmp")):
+             path = options.comparison_file or args[0]
+diff --git a/meld/meldwindow.py b/meld/meldwindow.py
+index d1ab4d8..5842499 100644
+--- a/meld/meldwindow.py
++++ b/meld/meldwindow.py
+@@ -437,6 +437,15 @@ class MeldWindow(Gtk.ApplicationWindow):
+             return self.append_filediff(
+                 gfiles, merge_output=merge_output, meta=meta)
+ 
++    def append_conflictsview(self, repo):
++        # Local patch: the Conflicts tab (meld/conflictsview.py).
++        from meld.conflictsview import ConflictsView
++        doc = ConflictsView(self, repo)
++        self._append_page(doc)
++        self.notebook.on_label_changed(doc, doc.label_text, doc.tooltip_text)
++        self.notebook.set_current_page(self.notebook.page_num(doc))
++        return doc
++
+     def append_vcview(self, location, auto_compare=False):
+         doc = VcView()
+         self._append_page(doc)
+diff --git a/test/test_conflicts.py b/test/test_conflicts.py
+new file mode 100644
+index 0000000..814c125
+--- /dev/null
++++ b/test/test_conflicts.py
+@@ -0,0 +1,120 @@
++"""Tests for the Conflicts tab's git and text helpers (local patch).
++
++Assumptions pinned: `git ls-files -u -z` prints "<mode> <sha> <stage>\\t<path>"
++records separated by NUL, one per stage present; stage 1 is the base, 2
++ours, 3 theirs.
++"""
++
++import os
++import subprocess
++import tempfile
++import unittest
++
++from meld.conflicts import (
++    auto_resolve,
++    is_binary,
++    mergeable,
++    parse_unmerged,
++    side_status,
++    split_text,
++    unmerged,
++)
++
++SHA = "0" * 40
++
++
++def record(stage, path):
++    return f"100644 {SHA} {stage}\t{path}".encode() + b"\0"
++
++
++class ParseTests(unittest.TestCase):
++
++    def test_parse_unmerged_groups_stages_by_path(self):
++        out = (record(1, "a.txt") + record(2, "a.txt") + record(3, "a.txt") +
++               record(1, "dir/b c.txt") + record(2, "dir/b c.txt"))
++        self.assertEqual(parse_unmerged(out),
++                         {"a.txt": {1, 2, 3}, "dir/b c.txt": {1, 2}})
++
++    def test_side_status(self):
++        self.assertEqual(side_status({1, 2, 3}, 2), "Modified")
++        self.assertEqual(side_status({1, 2}, 3), "Deleted")
++        self.assertEqual(side_status({2, 3}, 2), "Added")
++
++    def test_mergeable(self):
++        text = {2: b"a\n", 3: b"b\n"}
++        self.assertTrue(mergeable({1, 2, 3}, text))
++        self.assertTrue(mergeable({2, 3}, text))           # add/add
++        self.assertFalse(mergeable({1, 2}, text))          # theirs deleted
++        self.assertFalse(mergeable({1, 2, 3}, {2: b"a\0", 3: b"b"}))
++        self.assertTrue(is_binary(b"x\0y"))
++        self.assertFalse(is_binary(b"plain"))
++
++
++class TextTests(unittest.TestCase):
++
++    def test_split_text_keeps_the_trailing_empty_line_and_the_line_break(self):
++        self.assertEqual(split_text("a\r\nb\r\n"), (["a", "b", ""], "\r\n"))
++        self.assertEqual(split_text("a\nb"), (["a", "b"], "\n"))
++
++    def test_auto_resolve_merges_non_overlapping_changes(self):
++        base = b"one\ntwo\nthree\nfour\nfive\n"
++        ours = b"ONE\ntwo\nthree\nfour\nfive\n"
++        theirs = b"one\ntwo\nthree\nfour\nFIVE\n"
++        self.assertEqual(auto_resolve({1: base, 2: ours, 3: theirs}),
++                         b"ONE\ntwo\nthree\nfour\nFIVE\n")
++
++    def test_auto_resolve_uses_the_wand_on_word_edits(self):
++        base = b"cn('flex gap-6 py-10')\n"
++        ours = b"cn('py-10')\n"
++        theirs = b"cn('flex gap-6 py-10 lg:flex-row')\n"
++        self.assertEqual(auto_resolve({1: base, 2: ours, 3: theirs}),
++                         b"cn('py-10 lg:flex-row')\n")
++
++    def test_auto_resolve_keeps_crlf_line_breaks(self):
++        base = b"one\r\ntwo\r\nthree\r\nfour\r\n"
++        ours = b"ONE\r\ntwo\r\nthree\r\nfour\r\n"
++        theirs = b"one\r\ntwo\r\nthree\r\nFOUR\r\n"
++        self.assertEqual(auto_resolve({1: base, 2: ours, 3: theirs}),
++                         b"ONE\r\ntwo\r\nthree\r\nFOUR\r\n")
++
++    def test_auto_resolve_gives_up_on_a_true_conflict_or_non_utf8(self):
++        self.assertIsNone(auto_resolve({1: b"a\n", 2: b"b\n", 3: b"c\n"}))
++        self.assertIsNone(auto_resolve({1: b"a\n", 2: b"\xff\n", 3: b"a\n"}))
++
++
++class GitTests(unittest.TestCase):
++
++    def test_unmerged_reads_a_real_conflict(self):
++        with tempfile.TemporaryDirectory() as repo:
++            def run(*args):
++                subprocess.run(["git", *args], cwd=repo, check=True,
++                               capture_output=True)
++            run("init", "-q", "-b", "main")
++            run("config", "user.name", "t")
++            run("config", "user.email", "t@example.invalid")
++            def out(*args, input=None):
++                return subprocess.run(
++                    ["git", *args], cwd=repo, check=True, input=input,
++                    capture_output=True).stdout.decode().strip()
++            path = os.path.join(repo, "f.txt")
++            with open(path, "w") as f:
++                f.write("x\n")
++            run("add", "f.txt")
++            run("commit", "-qm", "base")
++            base = out("rev-parse", "HEAD")
++            # "theirs" is committed with plumbing, so the checked-out
++            # branch never changes.
++            blob = out("hash-object", "-w", "--stdin", input=b"theirs\n")
++            tree = out("mktree", input=f"100644 blob {blob}\tf.txt\n".encode())
++            theirs = out("commit-tree", tree, "-p", base, "-m", "theirs")
++            run("update-ref", "refs/heads/other", theirs)
++            with open(path, "w") as f:
++                f.write("ours\n")
++            run("commit", "-qam", "ours")
++            subprocess.run(["git", "merge", "other"], cwd=repo,
++                           capture_output=True)
++            self.assertEqual(unmerged(repo), {"f.txt": {1, 2, 3}})
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

@@ -1,0 +1,16 @@
+meldown
+
+The patches in patches/ modify Meld (https://gitlab.gnome.org/GNOME/meld) and, like Meld, are licensed under the GNU General Public License, version 2 or later (see LICENSE). The same applies to meldown-merge.sh and make-test-repo.sh.
+
+The files in theme/ are covered by the Apache License, Version 2.0 (see LICENSES/Apache-2.0.txt), because they are derived from JetBrains' open-source intellij-community repository (https://github.com/JetBrains/intellij-community):
+
+- theme/intellij-islands-dark.xml takes its colour values from platform/platform-resources/src/themes/islands/IslandSchemeDark.xml and platform/platform-resources/src/DefaultColorSchemesManager.xml, rewritten as a GtkSourceView style scheme.
+- theme/icons/*.png are based on the merge icons in platform/icons/src/expui/diff/, rendered to 16x16 PNGs and lightened for a dark theme.
+
+Both were modified from the originals as described above. intellij-community's NOTICE reads:
+
+    This software includes code from IntelliJ IDEA
+    Copyright (C) JetBrains s.r.o.
+    https://www.jetbrains.com/idea/
+
+meldown is not affiliated with or endorsed by JetBrains or the GNOME project. PhpStorm and IntelliJ IDEA are trademarks of JetBrains s.r.o.

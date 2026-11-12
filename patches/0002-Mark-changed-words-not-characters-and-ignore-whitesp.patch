@@ -1,0 +1,324 @@
+From c8b006000aa639919e88608601fa22661a188be8 Mon Sep 17 00:00:00 2001
+From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
+Date: Wed, 11 Nov 2026 20:09:04 +0200
+Subject: [PATCH 2/5] Mark changed words, not characters, and ignore whitespace
+
+Inline highlighting compared character by character and drew whitespace
+inside highlights, so a re-indented block marked every added space and
+line break with dots and arrows. Compare words and punctuation instead,
+never whitespace, and mark a run of changed words as one span. A stray
+matching '?' or '(' on one line no longer splits a change in pieces.
+
+Conflict chunks with lines on both sides get the same word marks;
+before, only plain changes did. Whitespace glyphs are no longer drawn
+inside highlights.
+---
+ meld/filediff.py         |   5 +-
+ meld/matchers/helpers.py |   5 +-
+ meld/matchers/words.py   | 118 +++++++++++++++++++++++++++++++++++++++
+ meld/sourceview.py       |   4 +-
+ test/test_words.py       |  99 ++++++++++++++++++++++++++++++++
+ 5 files changed, 227 insertions(+), 4 deletions(-)
+ create mode 100644 meld/matchers/words.py
+ create mode 100644 test/test_words.py
+
+diff --git a/meld/filediff.py b/meld/filediff.py
+index 461f174..ef3a89a 100644
+--- a/meld/filediff.py
++++ b/meld/filediff.py
+@@ -40,6 +40,7 @@ from meld.iohelpers import find_shared_parent_path, prompt_save_filename
+ from meld.matchers.diffutil import Differ, merged_chunk_order
+ from meld.matchers.helpers import CachedSequenceMatcher
+ from meld.matchers.merge import AutoMergeDiffer, Merger
++from meld.matchers.words import wants_inline_highlight
+ from meld.meldbuffer import (
+     BufferDeletionAction,
+     BufferInsertionAction,
+@@ -1982,7 +1983,7 @@ class FileDiff(Gtk.Box, MeldDoc):
+ 
+         for chunks in need_clearing:
+             for i, chunk in enumerate(chunks):
+-                if not chunk or chunk.tag != "replace":
++                if not chunk or not wants_inline_highlight(chunk):
+                     continue
+                 to_idx = 2 if i == 1 else 0
+                 bufs = self.textbuffer[1], self.textbuffer[to_idx]
+@@ -1994,7 +1995,7 @@ class FileDiff(Gtk.Box, MeldDoc):
+         for chunks in need_highlighting:
+             clear = chunks == modified_chunks
+             for merge_cache_index, chunk in enumerate(chunks):
+-                if not chunk or chunk[0] != "replace":
++                if not chunk or not wants_inline_highlight(chunk):
+                     continue
+                 to_pane = 2 if merge_cache_index == 1 else 0
+                 bufs = self.textbuffer[1], self.textbuffer[to_pane]
+diff --git a/meld/matchers/helpers.py b/meld/matchers/helpers.py
+index b989f3f..367a3fb 100644
+--- a/meld/matchers/helpers.py
++++ b/meld/matchers/helpers.py
+@@ -7,6 +7,7 @@ import time
+ from gi.repository import GLib
+ 
+ from meld.matchers import myers
++from meld.matchers.words import WordSequenceMatcher
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -15,7 +16,9 @@ class MatcherWorker(multiprocessing.Process):
+ 
+     END_TASK = -1
+ 
+-    matcher_class = myers.InlineMyersSequenceMatcher
++    # Local patch: word-level, whitespace-blind (meld/matchers/words.py)
++    # instead of myers.InlineMyersSequenceMatcher's character level.
++    matcher_class = WordSequenceMatcher
+ 
+     def __init__(self, tasks, results):
+         super().__init__()
+diff --git a/meld/matchers/words.py b/meld/matchers/words.py
+new file mode 100644
+index 0000000..675b001
+--- /dev/null
++++ b/meld/matchers/words.py
+@@ -0,0 +1,118 @@
++# Copyright (C) 2026 Giorgos Sarigiannidis
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 2 of the License, or (at
++# your option) any later version.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++"""Word-level inline matching (local patch, not upstream Meld).
++
++Meld's stock inline highlighting compares character by character, so a
++re-indented block marks every added space and line break. This matcher
++compares words and punctuation instead and never looks at whitespace, so
++whitespace-only differences mark nothing, and a run of changed words is
++marked as one span, spaces included.
++
++It returns only the differing spans. Meld's highlighter also marks any
++"equal" match shorter than three characters, which at word level would
++mark every short token ("}", "(") on a re-indented line.
++"""
++
++import re
++from typing import List, Tuple
++
++from meld.matchers.myers import DiffChunk, MyersSequenceMatcher
++
++# A word, or any single character that is neither a word character nor
++# whitespace. Whitespace is never a token.
++TOKEN_RE = re.compile(r"\w+|[^\w\s]")
++
++Token = Tuple[str, int, int]
++
++
++def tokenise(text: str) -> List[Token]:
++    """(token, start offset, end offset) for every non-whitespace token."""
++    return [(m.group(), m.start(), m.end()) for m in TOKEN_RE.finditer(text)]
++
++
++def _char_span(tokens: List[Token], lo: int, hi: int) -> Tuple[int, int]:
++    """Character offsets covering tokens[lo:hi]. An empty range sits right
++    after the token before it, so an insertion marks nothing on that side."""
++    if lo < hi:
++        return tokens[lo][1], tokens[hi - 1][2]
++    pos = tokens[lo - 1][2] if lo > 0 else 0
++    return pos, pos
++
++
++def _gap_text(text: str, tokens: List[Token], lo: int, hi: int) -> str:
++    """The text from the end of the token before tokens[lo] to the start of
++    the token after tokens[hi - 1], whitespace included; either end falls
++    back to the start or end of the text."""
++    start = tokens[lo - 1][2] if lo > 0 else 0
++    end = tokens[hi][1] if hi < len(tokens) else len(text)
++    return text[start:end]
++
++
++def wants_inline_highlight(chunk) -> bool:
++    """Whether filediff should mark the changed words inside a chunk.
++
++    Stock Meld does this for "replace" chunks only. Conflicts get it too,
++    so the words that differ stand out there as well, but only when both
++    sides have lines: against an empty side every word would be marked,
++    which only repeats the chunk's own colour."""
++    if chunk.tag == "replace":
++        return True
++    return (chunk.tag == "conflict" and
++            chunk.start_a != chunk.end_a and chunk.start_b != chunk.end_b)
++
++
++class WordSequenceMatcher:
++    """Drop-in for InlineMyersSequenceMatcher in MatcherWorker: built as
++    (isjunk, a, b) on two strings, and get_opcodes() returns DiffChunks in
++    character offsets."""
++
++    def __init__(self, isjunk=None, a="", b=""):
++        if isjunk is not None:
++            raise NotImplementedError('isjunk is not supported')
++        self.a = a
++        self.b = b
++
++    def get_opcodes(self) -> List[DiffChunk]:
++        tokens_a = tokenise(self.a)
++        tokens_b = tokenise(self.b)
++        matcher = MyersSequenceMatcher(
++            None, [t[0] for t in tokens_a], [t[0] for t in tokens_b])
++        opcodes = matcher.get_opcodes()
++        chunks = []
++        for n, (tag, i1, i2, j1, j2) in enumerate(opcodes):
++            if tag == "equal":
++                continue
++            start_a, end_a = _char_span(tokens_a, i1, i2)
++            start_b, end_b = _char_span(tokens_b, j1, j2)
++            if chunks and self._bridges(opcodes[n - 1], tokens_a, tokens_b):
++                # Join this change to the previous one across the
++                # punctuation between them, so one edit reads as one span.
++                prev = chunks.pop()
++                tag = "replace"
++                start_a, start_b = prev.start_a, prev.start_b
++            chunks.append(DiffChunk(tag, start_a, end_a, start_b, end_b))
++        return chunks
++
++    def _bridges(self, equal, tokens_a, tokens_b) -> bool:
++        """Whether an equal run between two changes is only punctuation on
++        one line. A stray "?" or "(" that happens to match would otherwise
++        split one changed line into fragments; a matching word, or a line
++        break, keeps the two changes apart."""
++        _tag, i1, i2, j1, j2 = equal
++        if any(t[0][0].isalnum() or t[0][0] == "_" for t in tokens_a[i1:i2]):
++            return False
++        return ("\n" not in _gap_text(self.a, tokens_a, i1, i2) and
++                "\n" not in _gap_text(self.b, tokens_b, j1, j2))
+diff --git a/meld/sourceview.py b/meld/sourceview.py
+index 63acb9d..195514f 100644
+--- a/meld/sourceview.py
++++ b/meld/sourceview.py
+@@ -205,7 +205,9 @@ class MeldSourceView(GtkSource.View, SourceViewHelperMixin):
+ 
+         buf = MeldBuffer()
+         inline_tag = GtkSource.Tag.new("inline")
+-        inline_tag.props.draw_spaces = True
++        # Local patch: no whitespace dots or arrows inside highlights; the
++        # word matcher ignores whitespace, so drawing it only adds noise.
++        inline_tag.props.draw_spaces = False
+         buf.get_tag_table().add(inline_tag)
+         buf.create_tag("dimmed")
+         self.set_buffer(buf)
+diff --git a/test/test_words.py b/test/test_words.py
+new file mode 100644
+index 0000000..9dfa35b
+--- /dev/null
++++ b/test/test_words.py
+@@ -0,0 +1,99 @@
++"""Tests for the word-level inline matcher (local patch).
++
++Assumptions pinned: Meld's MatcherWorker builds its matcher as
++matcher_class(None, text1, textn) and reads get_opcodes() as DiffChunks
++(tag, start_a, end_a, start_b, end_b) in character offsets; filediff
++highlights every non-equal chunk it gets back.
++"""
++
++import unittest
++
++from meld.matchers.myers import DiffChunk
++from meld.matchers.words import (
++    WordSequenceMatcher,
++    tokenise,
++    wants_inline_highlight,
++)
++
++
++def marked(a, b):
++    """The (a, b) substrings each chunk marks."""
++    chunks = WordSequenceMatcher(None, a, b).get_opcodes()
++    return [(a[c.start_a:c.end_a], b[c.start_b:c.end_b]) for c in chunks]
++
++
++class WordMatcherTests(unittest.TestCase):
++
++    def test_tokenise_skips_whitespace(self):
++        self.assertEqual(
++            [t[0] for t in tokenise("  foo(bar, 1)\n")],
++            ["foo", "(", "bar", ",", "1", ")"])
++
++    def test_identical_text_marks_nothing(self):
++        self.assertEqual(marked("a b c", "a b c"), [])
++
++    def test_whitespace_only_difference_marks_nothing(self):
++        # A re-indented block, wrapped lines and changed spacing.
++        a = "if (x) {\n  y();\n}\n"
++        b = "if (x) {\n        y();\n    }\n\n"
++        self.assertEqual(marked(a, b), [])
++
++    def test_changed_word_marks_only_that_word(self):
++        a = "<Container className={cn('flex flex-col gap-6 py-10')}>"
++        b = "<Container className={cn('py-10')}>"
++        self.assertEqual(marked(a, b), [("flex flex-col gap-6", "")])
++
++    def test_run_of_inserted_words_is_one_span_with_its_spaces(self):
++        a = "cn('gap-6 py-10')"
++        b = "cn('gap-6 py-10 lg:flex-row lg:items-center')"
++        self.assertEqual(marked(a, b), [("", "lg:flex-row lg:items-center")])
++
++    def test_replaced_word(self):
++        self.assertEqual(marked("level={1}", "level={2}"), [("1", "2")])
++
++    def test_insertion_at_start_and_empty_sides(self):
++        self.assertEqual(marked("b", "a b"), [("", "a")])
++        self.assertEqual(marked("", "x"), [("", "x")])
++        self.assertEqual(marked("x", ""), [("x", "")])
++
++    def test_matching_punctuation_does_not_split_a_changed_line(self):
++        # Meld's "(??)" conflict placeholder against a real line: the "?"s
++        # match, but the line should still read as one change.
++        a = "(??)"
++        b = "    cards?: { heading?: string }[];"
++        self.assertEqual(marked(a, b), [("(??)", "cards?: { heading?: string }[];")])
++
++    def test_matching_word_keeps_changes_apart(self):
++        self.assertEqual(
++            marked("a = foo(1)", "b = foo(2)"), [("a", "b"), ("1", "2")])
++
++    def test_punctuation_across_a_line_break_keeps_changes_apart(self):
++        a = "one(\n)two"
++        b = "uno(\n)dos"
++        self.assertEqual(marked(a, b), [("one", "uno"), ("two", "dos")])
++
++    def test_insertions_at_the_edges_do_not_fail(self):
++        self.assertEqual(marked("? x", "y ? x z"), [("", "y"), ("", "z")])
++        self.assertEqual(marked("a ?", "? b ?"), [("a", "? b")])
++
++    def test_offsets_are_characters_not_bytes(self):
++        a = "τίτλος old"
++        b = "τίτλος new"
++        self.assertEqual(marked(a, b), [("old", "new")])
++
++
++class InlineHighlightScopeTests(unittest.TestCase):
++
++    def test_replace_and_two_sided_conflicts_are_highlighted(self):
++        self.assertTrue(wants_inline_highlight(DiffChunk("replace", 1, 2, 1, 2)))
++        self.assertTrue(wants_inline_highlight(DiffChunk("conflict", 1, 3, 4, 5)))
++
++    def test_one_sided_conflicts_and_plain_inserts_are_not(self):
++        self.assertFalse(wants_inline_highlight(DiffChunk("conflict", 1, 1, 4, 5)))
++        self.assertFalse(wants_inline_highlight(DiffChunk("conflict", 1, 3, 4, 4)))
++        self.assertFalse(wants_inline_highlight(DiffChunk("insert", 1, 1, 4, 5)))
++        self.assertFalse(wants_inline_highlight(DiffChunk("delete", 1, 3, 4, 4)))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

@@ -1,0 +1,1167 @@
+From de15996690a7187fac13c6b361e2bb833427f173 Mon Sep 17 00:00:00 2001
+From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
+Date: Wed, 11 Nov 2026 20:29:03 +0200
+Subject: [PATCH 3/5] Add a base-anchored three-way merge model
+
+Stock Meld diffs the result against each side and recomputes after every
+edit, so an applied change just stops being a difference and a dismissed
+one comes back. Like PhpStorm, fix the changes once against the common
+base and read each one's state from the result text: applied when the
+text there equals that side (or both sides joined, or the magic wand's
+word-level merge); only dismissals are stored, as the text they were
+made against. Undo, typing and reopening a half-done file all follow.
+
+The result is read as the base's unchanged runs in order with each run
+of touching changes between them holding one of its known texts, so
+look-alike lines cannot misplace a change; a base->result diff is the
+fallback when an unchanged run itself was edited.
+
+AnchoredMergeDiffer keeps Meld's own result<->side chunks for alignment
+and re-tags them from the model: conflict, the usual change tags, or a
+new 'resolved'. Nothing uses it yet; the merge view comes next.
+---
+ meld/matchers/anchored.py | 704 ++++++++++++++++++++++++++++++++++++++
+ test/test_anchored.py     | 420 +++++++++++++++++++++++
+ 2 files changed, 1124 insertions(+)
+ create mode 100644 meld/matchers/anchored.py
+ create mode 100644 test/test_anchored.py
+
+diff --git a/meld/matchers/anchored.py b/meld/matchers/anchored.py
+new file mode 100644
+index 0000000..dc472dd
+--- /dev/null
++++ b/meld/matchers/anchored.py
+@@ -0,0 +1,704 @@
++# Copyright (C) 2026 Giorgos Sarigiannidis
++#
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 2 of the License, or (at
++# your option) any later version.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++"""A base-anchored three-way merge (local patch, not upstream Meld).
++
++Stock Meld diffs the result pane against each side and recomputes after
++every edit, so a change it applied simply stops being a difference and a
++dismissed change comes straight back. PhpStorm instead fixes the changes
++once, against the common base, and tracks each one's state. This module
++does the same:
++
++- Change groups are worked out once from base->left and base->right. In a
++  merge the left, base and right texts never change, only the result does.
++- Each group's place in the result comes from a base->result line diff,
++  kept up to date incrementally as the result is edited.
++- A side's state is read from the result text, never stored: it is applied
++  when the result there equals that side's text (or, for a conflict, both
++  sides joined, or the magic wand's merge). Undo, typing and reopening a
++  half-done file therefore all follow from one rule. Only dismissals (the
++  X) are stored, as the text they were made against; one holds only while
++  the result there still has that text.
++
++AnchoredMergeDiffer feeds this into the rest of Meld by keeping Meld's own
++result<->side chunks, so pane alignment and link maps keep working, and
++re-tagging each chunk by the state of the group it covers.
++
++Texts are lists of lines without line endings, as Meld's BufferLines give
++them; lines are only compared, never edited, here.
++"""
++
++import enum
++import re
++from dataclasses import dataclass
++from typing import Dict, List, Optional, Sequence, Tuple
++
++from meld.matchers.diffutil import Differ
++from meld.matchers.myers import DiffChunk
++
++LEFT, RIGHT = 0, 1
++
++Range = Tuple[int, int]
++# A base->result difference: (base_lo, base_hi, result_lo, result_hi).
++Chunk = Tuple[int, int, int, int]
++
++
++class Kind(enum.Enum):
++    LEFT = 'left'          # only the left side changed this block
++    RIGHT = 'right'        # only the right side changed it
++    BOTH = 'both'          # both sides made the same change
++    CONFLICT = 'conflict'  # the sides changed it differently
++
++
++class SideState(enum.Enum):
++    NONE = 'none'              # this side did not change this block
++    UNRESOLVED = 'unresolved'
++    APPLIED = 'applied'
++    DISMISSED = 'dismissed'
++
++
++HANDLED = (SideState.NONE, SideState.APPLIED, SideState.DISMISSED)
++
++
++@dataclass
++class Group:
++    index: int
++    kind: Kind
++    base: Range
++    # Each side's range in its own text, or None when it has no change here.
++    sides: Tuple[Optional[Range], Optional[Range]]
++
++
++@dataclass
++class Edit:
++    """Replace result lines [start, end) with lines."""
++    start: int
++    end: int
++    lines: List[str]
++
++
++def exit_status(saved_resolved: bool, edited_since_save: bool) -> int:
++    """Meld's exit status for a merge: 0 only when the result was saved with
++    nothing unresolved and not edited since, so `git mergetool` (with
++    trustExitCode) never marks a half-done or unsaved file resolved."""
++    return 0 if saved_resolved and not edited_since_save else 1
++
++
++# Whitespace runs, words and single punctuation characters: every character
++# of the text belongs to exactly one token, so joining them rebuilds it.
++WAND_TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]")
++
++
++def merge3(left: Sequence, base: Sequence, right: Sequence) -> Optional[list]:
++    """A plain three-way merge of any sequences: every change from either
++    side applied to base, or None when two changes overlap differently."""
++    differ = Differ()
++    for _ in differ.set_sequences_iter([left, base, right]):
++        pass
++    out, pos = [], 0
++    for c0, c1 in differ.all_changes():
++        if c0 is not None and c1 is not None and c0.tag == 'conflict':
++            return None
++        chunk, source = (c0, left) if c0 is not None else (c1, right)
++        out.extend(base[pos:chunk.start_a])
++        out.extend(source[chunk.start_b:chunk.end_b])
++        pos = chunk.end_a
++    out.extend(base[pos:])
++    return out
++
++
++def wand_merge(left: List[str], base: List[str],
++               right: List[str]) -> Optional[List[str]]:
++    """The magic wand: merge a conflicting block word by word. A line-level
++    conflict is often two edits to different words of the same lines (one
++    side removes classes, the other adds some), which merge cleanly here.
++    None when the sides still change the same words differently."""
++    def tokens(block):
++        return WAND_TOKEN_RE.findall("\n".join(block))
++
++    merged = merge3(tokens(left), tokens(base), tokens(right))
++    if merged is None:
++        return None
++    text = "".join(merged)
++    return text.split("\n") if text else []
++
++
++def build_groups(left, base, right) -> List[Group]:
++    """The change groups between base and the two sides, using Meld's own
++    three-way grouping (Differ._merge_diffs), which tags overlapping
++    changes as conflicts."""
++    differ = Differ()
++    for _ in differ.set_sequences_iter([left, base, right]):
++        pass
++    groups = []
++    for c0, c1 in differ.all_changes():
++        if c0 is not None and c1 is not None:
++            kind = Kind.CONFLICT if c0.tag == 'conflict' else Kind.BOTH
++        else:
++            kind = Kind.LEFT if c0 is not None else Kind.RIGHT
++        either = c0 if c0 is not None else c1
++        groups.append(Group(
++            index=len(groups),
++            kind=kind,
++            base=(either.start_a, either.end_a),
++            sides=(
++                (c0.start_b, c0.end_b) if c0 is not None else None,
++                (c1.start_b, c1.end_b) if c1 is not None else None,
++            ),
++        ))
++    return groups
++
++
++class AnchoredMerge:
++    """The change groups of one merge and their state in the result."""
++
++    def __init__(self, left, base, right, result=None):
++        self.left = list(left)
++        self.base = list(base)
++        self.right = list(right)
++        self.groups = build_groups(self.left, self.base, self.right)
++        self.dismissed: Dict[Tuple[int, int], List[str]] = {}
++        self._wand_cache: Dict[int, Optional[List[str]]] = {}
++        # Preferred readings for ambiguous text: each group's previous text,
++        # and the text an arrow just put in (it arrives as a delete and an
++        # insert, so it must outlast the first of the two).
++        self._previous: Dict[int, List[str]] = {}
++        self._acted: Dict[int, List[str]] = {}
++        self.result: Sequence[str] = list(self.base if result is None else result)
++        # Hidden two-way differ: sequence 1 is the result, sequence 0 the
++        # base, so its chunks run result (a) -> base (b).
++        self._base_differ = Differ()
++        for _ in self._base_differ.set_sequences_iter([self.base, self.result]):
++            pass
++        self.ranges: List[Range] = []
++        self._remap()
++
++    # -- texts ---------------------------------------------------------------
++
++    def side_lines(self, group: Group, side: int) -> List[str]:
++        rng = group.sides[side]
++        if rng is None:
++            return self.base[group.base[0]:group.base[1]]
++        text = self.left if side == LEFT else self.right
++        return text[rng[0]:rng[1]]
++
++    def base_lines(self, group: Group) -> List[str]:
++        return self.base[group.base[0]:group.base[1]]
++
++    def result_lines(self, index: int) -> List[str]:
++        start, end = self.ranges[index]
++        return list(self.result[start:end])
++
++    # -- keeping up with the result --------------------------------------------
++
++    def result_changed(self, startidx: int, sizechange: int, result) -> None:
++        """Call after every edit of the result, with Meld's own arguments
++        to Differ.change_sequence and the result's current lines."""
++        # What each group held before this edit: when a later reading is
++        # ambiguous, groups keep their previous state (see _candidates).
++        self._previous = {i: self.result_lines(i) for i in range(len(self.groups))}
++        self._previous.update(self._acted)
++        self.result = result
++        self._base_differ.change_sequence(
++            1, startidx, sizechange, [self.base, result])
++        self._remap()
++
++    def _chunks(self) -> List[Chunk]:
++        return [(c.start_b, c.end_b, c.start_a, c.end_a)
++                for c in self._base_differ.diffs[0]]
++
++    def _segments(self) -> List[List[Group]]:
++        """Groups split into runs that touch in the base (one ends where
++        the next starts). Unchanged base lines separate the runs and anchor
++        them in the result; within a run, a line diff cannot tell which
++        result lines belong to which group, so _split decides by text."""
++        segments: List[List[Group]] = []
++        for group in self.groups:
++            if segments and segments[-1][-1].base[1] == group.base[0]:
++                segments[-1].append(group)
++            else:
++                segments.append([group])
++        return segments
++
++    def _remap(self) -> None:
++        parsed = self._parse()
++        if parsed is not None:
++            self.ranges = parsed
++            return
++        chunks = self._chunks()
++        self.ranges = []
++        for segment in self._segments():
++            base = (segment[0].base[0], segment[-1].base[1])
++            rng = self._map(base, chunks)
++            split = self._split(segment, rng)
++            if split is None:
++                rng, split = self._map_with_slides(segment, base, chunks, rng)
++            if split is None:
++                split = self._split_loosely(segment, rng)
++            self.ranges.extend(split)
++
++    def _parse(self) -> Optional[List[Range]]:
++        """Read the result as the base's unchanged runs ("anchors") in
++        order, with each segment of groups between them holding one of its
++        candidate texts, or, when edited by hand, any text up to where the
++        next anchor matches. This needs no diff, so look-alike lines (a
++        "}", a blank line) cannot pull a range off. Of all readings, the one
++        with the fewest hand-edited segments wins. None when an anchor
++        itself was edited; _remap then falls back to the base->result diff.
++        """
++        segments = self._segments()
++        if not segments:
++            return []
++        result = list(self.result)
++        total = len(result)
++        bounds = [0] + [x for s in segments for x in (s[0].base[0], s[-1].base[1])] + [len(self.base)]
++        anchors = [self.base[bounds[2 * k]:bounds[2 * k + 1]]
++                   for k in range(len(segments) + 1)]
++        # Where each line occurs in the result, to find anchors quickly.
++        where: Dict[str, List[int]] = {}
++        for pos, line in enumerate(result):
++            where.setdefault(line, []).append(pos)
++
++        def anchor_at(k: int, pos: int) -> bool:
++            anchor = anchors[k]
++            return result[pos:pos + len(anchor)] == anchor
++
++        def anchor_starts(k: int, lo: int) -> List[int]:
++            anchor = anchors[k]
++            if not anchor:
++                return list(range(lo, total + 1))
++            return [p for p in where.get(anchor[0], ()) if p >= lo and anchor_at(k, p)]
++
++        if not anchor_at(0, 0):
++            return None
++        # states: position after anchor k -> (hand-edited count, ranges so far)
++        states: Dict[int, Tuple[int, List[Range]]] = {len(anchors[0]): (0, [])}
++        for k, segment in enumerate(segments):
++            nxt: Dict[int, Tuple[int, List[Range]]] = {}
++
++            def offer(pos, cost, ranges):
++                if pos not in nxt or nxt[pos][0] > cost:
++                    nxt[pos] = (cost, ranges)
++
++            for start, (cost, ranges) in sorted(states.items()):
++                exact = self._splits_from(segment, result, start)
++                found = False
++                for end, split in exact:
++                    if anchor_at(k + 1, end):
++                        offer(end + len(anchors[k + 1]), cost, ranges + split)
++                        found = True
++                if found:
++                    continue
++                for end in anchor_starts(k + 1, start):
++                    split = self._split_loosely(segment, (start, end))
++                    offer(end + len(anchors[k + 1]), cost + 1, ranges + split)
++            states = nxt
++            if not states:
++                return None
++        final = states.get(total)
++        return final[1] if final is not None else None
++
++    def _splits_from(self, segment: List[Group], result: List[str],
++                     start: int) -> List[Tuple[int, List[Range]]]:
++        """Every way the segment's groups can each hold one of their
++        candidate texts, starting at start: (end, ranges), the first
++        reading per end (applied texts are tried first)."""
++        options = [self._candidates(g) for g in segment]
++        found: Dict[int, List[Range]] = {}
++
++        def walk(k: int, pos: int, ranges: List[Range]) -> None:
++            if k == len(segment):
++                found.setdefault(pos, ranges)
++                return
++            for cand in options[k]:
++                stop = pos + len(cand)
++                if result[pos:stop] == cand:
++                    walk(k + 1, stop, ranges + [(pos, stop)])
++
++        walk(0, start, [])
++        return sorted(found.items())
++
++    def _map(self, base: Range, chunks: List[Chunk]) -> Range:
++        """A base range's place in the result: shifted by every edit before
++        it and widened by every edit that touches it, insertions at either
++        end included."""
++        eff_s, eff_e = base
++        related = set()
++        changed = True
++        while changed:
++            changed = False
++            for i, (b0, b1, _r0, _r1) in enumerate(chunks):
++                if i in related:
++                    continue
++                if b0 == b1:
++                    touches = eff_s <= b0 <= eff_e
++                else:
++                    touches = (b0 < eff_e and b1 > eff_s) or b0 < eff_s < b1
++                if touches:
++                    related.add(i)
++                    eff_s, eff_e = min(eff_s, b0), max(eff_e, b1)
++                    changed = True
++
++        def delta(c: Chunk) -> int:
++            return (c[3] - c[2]) - (c[1] - c[0])
++
++        before = sum(delta(c) for i, c in enumerate(chunks)
++                     if i not in related and c[1] <= eff_s)
++        inside = sum(delta(chunks[i]) for i in related)
++        return eff_s + before, eff_e + before + inside
++
++    def _candidates(self, group: Group) -> List[List[str]]:
++        """Every text a group can hold that has a known meaning: applied
++        texts first, so when two readings give the same text the group
++        reads as applied (the result is the same either way), then base,
++        then texts it was dismissed against."""
++        texts = []
++        for side in (LEFT, RIGHT):
++            if group.sides[side] is not None:
++                texts.append(self.side_lines(group, side))
++        if group.kind == Kind.CONFLICT:
++            left = self.side_lines(group, LEFT)
++            right = self.side_lines(group, RIGHT)
++            texts += [left + right, right + left]
++            wand = self.wand_lines(group.index)
++            if wand is not None:
++                texts.append(wand)
++        texts.append(self.base_lines(group))
++        for side in (LEFT, RIGHT):
++            dismissed = self.dismissed.get((group.index, side))
++            if dismissed is not None:
++                texts.append(dismissed)
++        preferred = self._previous.get(group.index)
++        if preferred is not None and preferred in texts:
++            texts.insert(0, preferred)
++        unique = []
++        for text in texts:
++            if text not in unique:
++                unique.append(text)
++        return unique
++
++    def _split(self, segment: List[Group], rng: Range) -> Optional[List[Range]]:
++        """Divide a segment's result text among its groups so that each
++        part is one of that group's candidate texts, or None when no such
++        division exists (the text was edited by hand)."""
++        start, end = rng
++        text = list(self.result[start:end])
++        options = [self._candidates(g) for g in segment]
++        failed = set()
++
++        def walk(k: int, pos: int) -> Optional[List[Range]]:
++            if k == len(segment):
++                return [] if pos == len(text) else None
++            if (k, pos) in failed:
++                return None
++            for cand in options[k]:
++                stop = pos + len(cand)
++                if text[pos:stop] == cand:
++                    rest = walk(k + 1, stop)
++                    if rest is not None:
++                        return [(start + pos, start + stop)] + rest
++            failed.add((k, pos))
++            return None
++
++        return walk(0, 0)
++
++    def _split_loosely(self, segment: List[Group], rng: Range) -> List[Range]:
++        """For a segment edited by hand: groups that still match at either
++        end keep their text there, and one group left over takes all the
++        rest, so the typed text sits with one group whose X can keep it.
++        The end is matched first, so text typed on a boundary goes to the
++        earlier group."""
++        start, end = rng
++        text = list(self.result[start:end])
++        head, tail = [], []
++        lo, hi = 0, len(text)
++        i, j = 0, len(segment)
++        while j > i + 1:
++            match = next((c for c in self._candidates(segment[j - 1])
++                          if hi - len(c) >= lo and text[hi - len(c):hi] == c), None)
++            if match is None:
++                break
++            tail.insert(0, (start + hi - len(match), start + hi))
++            hi -= len(match)
++            j -= 1
++        while i < j - 1:
++            match = next((c for c in self._candidates(segment[i])
++                          if lo + len(c) <= hi and text[lo:lo + len(c)] == c), None)
++            if match is None:
++                break
++            head.append((start + lo, start + lo + len(match)))
++            lo += len(match)
++            i += 1
++        # Groups i..j-1 are left: the first takes the rest of the text, the
++        # others sit empty right after it.
++        middle = [(start + lo, start + hi)] + [(start + hi, start + hi)] * (j - i - 1)
++        return head + middle + tail
++
++    def _slides(self, chunks: List[Chunk], i: int) -> List[Chunk]:
++        """Positions a pure insertion or deletion can slide to over lines
++        that are identical at both of its ends, nearest first. A line diff
++        cannot tell these apart: a block ending in "}" inserted after
++        another "}" can be reported one line off."""
++        b0, b1, r0, r1 = chunks[i]
++        if b0 != b1 and r0 != r1:
++            return []
++        if b0 == b1:
++            text, lo, hi = self.result, r0, r1
++        else:
++            text, lo, hi = self.base, b0, b1
++        prev_end = chunks[i - 1][3 if b0 == b1 else 1] if i > 0 else 0
++        next_start = (chunks[i + 1][2 if b0 == b1 else 0]
++                      if i + 1 < len(chunks) else len(text))
++        down, up = [], []
++        k = 0
++        while hi + k < next_start and text[lo + k] == text[hi + k]:
++            k += 1
++            down.append(k)
++        k = 0
++        while lo - k > prev_end and text[lo - k - 1] == text[hi - k - 1]:
++            k += 1
++            up.append(-k)
++        offsets = sorted(down + up, key=abs)
++        return [(b0 + k, b1 + k, r0 + k, r1 + k) for k in offsets]
++
++    def _map_with_slides(self, segment: List[Group], base: Range,
++                         chunks: List[Chunk], fallback: Range):
++        """Try every slide of every insertion or deletion and keep the
++        first that lets the segment's text be divided among its groups;
++        sliding only crosses identical lines, so any match is the same
++        text. Returns (range, split), split None when nothing fits."""
++        for i in range(len(chunks)):
++            for slid in self._slides(chunks, i):
++                trial = chunks[:i] + [slid] + chunks[i + 1:]
++                rng = self._map(base, trial)
++                split = self._split(segment, rng)
++                if split is not None:
++                    return rng, split
++        return fallback, None
++
++    # -- state -----------------------------------------------------------------
++
++    def _is_applied(self, group: Group, side: int, text: List[str]) -> bool:
++        own = self.side_lines(group, side)
++        if group.kind != Kind.CONFLICT:
++            return text == own
++        if text == own:
++            return True
++        left = self.side_lines(group, LEFT)
++        right = self.side_lines(group, RIGHT)
++        # When one side deleted the block, applying both is the other
++        # side's text, so that text counts as both applied: the result is
++        # the same whichever was meant.
++        if text in (left + right, right + left):
++            return True
++        wand = self.wand_lines(group.index)
++        return wand is not None and text == wand
++
++    def side_state(self, index: int, side: int) -> SideState:
++        group = self.groups[index]
++        if group.sides[side] is None:
++            return SideState.NONE
++        text = self.result_lines(index)
++        if self._is_applied(group, side, text):
++            return SideState.APPLIED
++        if self.dismissed.get((index, side)) == text:
++            return SideState.DISMISSED
++        return SideState.UNRESOLVED
++
++    def is_resolved(self, index: int) -> bool:
++        return all(self.side_state(index, side) in HANDLED
++                   for side in (LEFT, RIGHT))
++
++    def counts(self) -> Tuple[int, int, int]:
++        """(changes, unresolved, conflicts): every group, the groups not yet
++        resolved, and the conflicts among those."""
++        unresolved = [g for g in self.groups if not self.is_resolved(g.index)]
++        conflicts = [g for g in unresolved if g.kind == Kind.CONFLICT]
++        return len(self.groups), len(unresolved), len(conflicts)
++
++    # -- actions ---------------------------------------------------------------
++
++    def apply(self, index: int, side: int) -> Optional[Edit]:
++        """The edit the arrow on this side makes: the side's text replaces
++        the group's result text, except on a conflict whose result is no
++        longer the base (the other side applied, or typed by hand), where it
++        is added after it."""
++        group = self.groups[index]
++        if group.sides[side] is None:
++            return None
++        start, end = self.ranges[index]
++        own = self.side_lines(group, side)
++        current = self.result_lines(index)
++        if group.kind == Kind.CONFLICT and current != self.base_lines(group):
++            edit = Edit(start, end, current + own)
++        else:
++            edit = Edit(start, end, own)
++        self._acted = {index: list(edit.lines)}
++        return edit
++
++    def dismiss(self, index: int, side: int) -> None:
++        """The X: keep the result as it is here and stop asking. A change
++        both sides made is dismissed on both."""
++        group = self.groups[index]
++        text = self.result_lines(index)
++        sides = (LEFT, RIGHT) if group.kind == Kind.BOTH else (side,)
++        for s in sides:
++            if group.sides[s] is not None:
++                self.dismissed[(index, s)] = text
++
++    def apply_non_conflicting(self, which: str) -> List[Edit]:
++        """Edits for "Apply non-conflicting changes": 'left', 'right' or
++        'all'. Last group first, so each edit leaves the ranges of the ones
++        still to apply where they were."""
++        wanted = {
++            'left': (Kind.LEFT, Kind.BOTH),
++            'right': (Kind.RIGHT, Kind.BOTH),
++            'all': (Kind.LEFT, Kind.RIGHT, Kind.BOTH),
++        }[which]
++        edits = []
++        for group in self.groups:
++            if group.kind not in wanted:
++                continue
++            side = RIGHT if group.kind == Kind.RIGHT else LEFT
++            if self.side_state(group.index, side) == SideState.UNRESOLVED:
++                edits.append(self.apply(group.index, side))
++        return sorted(edits, key=lambda e: e.start, reverse=True)
++
++    def wand_lines(self, index: int) -> Optional[List[str]]:
++        """The magic wand's merge of a conflict (wand_merge on just this
++        block), or None when it cannot merge it."""
++        if index not in self._wand_cache:
++            group = self.groups[index]
++            merged = None
++            if group.kind == Kind.CONFLICT:
++                merged = wand_merge(self.side_lines(group, LEFT),
++                                    self.base_lines(group),
++                                    self.side_lines(group, RIGHT))
++            self._wand_cache[index] = merged
++        return self._wand_cache[index]
++
++    def wand(self, index: int) -> Optional[Edit]:
++        """The wand's edit for one conflict, only while nothing has been
++        done to it yet (its result is still the base)."""
++        group = self.groups[index]
++        if (group.kind != Kind.CONFLICT or
++                self.result_lines(index) != self.base_lines(group)):
++            return None
++        merged = self.wand_lines(index)
++        if merged is None:
++            return None
++        start, end = self.ranges[index]
++        return Edit(start, end, merged)
++
++    def wand_all(self) -> List[Edit]:
++        edits = [self.wand(g.index) for g in self.groups]
++        return sorted((e for e in edits if e is not None),
++                      key=lambda e: e.start, reverse=True)
++
++
++def apply_edits(lines: List[str], edits: List[Edit]) -> List[str]:
++    """Apply edits (last first, as the model returns them) to a list of
++    lines; for whole-file writes and tests."""
++    lines = list(lines)
++    for edit in edits:
++        lines[edit.start:edit.end] = edit.lines
++    return lines
++
++
++def _geometric_tag(chunk: DiffChunk) -> str:
++    if chunk.start_a == chunk.end_a:
++        return 'insert'
++    if chunk.start_b == chunk.end_b:
++        return 'delete'
++    return 'replace'
++
++
++class AnchoredMergeDiffer(Differ):
++    """Meld's three-way differ, re-tagged from an AnchoredMerge.
++
++    The chunks stay Meld's own result<->side differences, so every real
++    difference keeps a chunk and pane alignment, link maps and next/previous
++    work unchanged. Only their tags change: 'conflict' while the group is an
++    unresolved conflict on that side, the usual insert/delete/replace while
++    that side's change is unresolved, and 'resolved' once it is handled.
++    Differences typed outside any group keep a plain tag.
++
++    The view sets base_lines before the comparison starts.
++    """
++
++    _URGENCY = {'resolved': 0, 'insert': 1, 'delete': 1, 'replace': 1,
++                'conflict': 2}
++
++    def __init__(self):
++        super().__init__()
++        self.base_lines: Optional[List[str]] = None
++        self.model: Optional[AnchoredMerge] = None
++
++    def set_sequences_iter(self, sequences):
++        if self.base_lines is not None and len(sequences) == 3:
++            self.model = AnchoredMerge(
++                list(sequences[0]), self.base_lines, list(sequences[2]),
++                list(sequences[1]))
++        yield from super().set_sequences_iter(sequences)
++
++    def change_sequence(self, sequence, startidx, sizechange, texts):
++        if self.model is not None and sequence == 1:
++            self.model.result_changed(startidx, sizechange, texts[1])
++        super().change_sequence(sequence, startidx, sizechange, texts)
++
++    def refresh(self, texts) -> None:
++        """Re-tag after a state change that edits no text (a dismissal)."""
++        self._old_merge_cache = set(self._merge_cache)
++        self._changed_chunks = tuple()
++        self._update_merge_cache(texts)
++
++    def _merge_diffs(self, seq0, seq1, texts):
++        for c0, c1 in super()._merge_diffs(seq0, seq1, texts):
++            if self.model is None:
++                yield c0, c1
++            else:
++                yield self._retag(c0, LEFT), self._retag(c1, RIGHT)
++
++    def _retag(self, chunk: Optional[DiffChunk], side: int):
++        if chunk is None:
++            return None
++        model = self.model
++        tag = None
++        for index in self._groups_over(chunk.start_a, chunk.end_a):
++            group = model.groups[index]
++            state = model.side_state(index, side)
++            if state in HANDLED:
++                candidate = 'resolved'
++            elif group.kind == Kind.CONFLICT:
++                candidate = 'conflict'
++            else:
++                candidate = _geometric_tag(chunk)
++            if tag is None or self._URGENCY[candidate] > self._URGENCY[tag]:
++                tag = candidate
++        if tag is None:
++            tag = _geometric_tag(chunk)
++        return chunk._replace(tag=tag)
++
++    def _groups_over(self, start: int, end: int) -> List[int]:
++        """Groups whose result range overlaps [start, end); an empty range
++        on either side overlaps when it touches."""
++        hits = []
++        for index, (r0, r1) in enumerate(self.model.ranges):
++            if start == end or r0 == r1:
++                if r0 <= end and start <= r1:
++                    hits.append(index)
++            elif r0 < end and start < r1:
++                hits.append(index)
++        return hits
+diff --git a/test/test_anchored.py b/test/test_anchored.py
+new file mode 100644
+index 0000000..9c875ac
+--- /dev/null
++++ b/test/test_anchored.py
+@@ -0,0 +1,420 @@
++"""Tests for the base-anchored merge model (local patch).
++
++Assumptions pinned: texts are lists of lines without line endings, as
++Meld's BufferLines give them. A result edit reaches the model the way
++filediff reports it to Differ.change_sequence: a deletion as
++(startline, -lines_removed) and an insertion as (startline, lines_added),
++each with the result's lines after that step. Differ.change_sequence and
++Differ._merge_diffs behave as in Meld 3.24.1.
++"""
++
++import random
++import unittest
++
++from meld.matchers.anchored import (
++    LEFT,
++    RIGHT,
++    AnchoredMerge,
++    AnchoredMergeDiffer,
++    Edit,
++    Kind,
++    SideState,
++    apply_edits,
++    exit_status,
++    merge3,
++    wand_merge,
++)
++
++
++def lines(text):
++    return text.split()
++
++
++def do_edit(target, edit, sides=None):
++    """Apply an Edit to the result the way Meld reports it: delete, then
++    insert. target is an AnchoredMerge, or an AnchoredMergeDiffer with
++    sides=(left, right)."""
++    result = list(target.model.result if sides else target.result)
++    after_delete = result[:edit.start] + result[edit.end:]
++    after_insert = after_delete[:edit.start] + edit.lines + after_delete[edit.start:]
++    for size, text in ((-(edit.end - edit.start), after_delete),
++                       (len(edit.lines), after_insert)):
++        if sides:
++            target.change_sequence(1, edit.start, size, [sides[0], text, sides[1]])
++        else:
++            target.result_changed(edit.start, size, text)
++    return after_insert
++
++
++BASE = lines("a b c d e f g h i j")
++# Left: changes c (left only), inserts X after e (same on both), changes h.
++LEFT_T = lines("a b C d e X f g H i j")
++# Right: inserts X after e (same on both), changes h differently, changes j.
++RIGHT_T = lines("a b c d e X f g h2 i J")
++
++
++class GroupingTests(unittest.TestCase):
++
++    def test_kinds(self):
++        m = AnchoredMerge(LEFT_T, BASE, RIGHT_T)
++        self.assertEqual([g.kind for g in m.groups],
++                         [Kind.LEFT, Kind.BOTH, Kind.CONFLICT, Kind.RIGHT])
++
++    def test_everything_starts_unresolved_and_result_is_base(self):
++        m = AnchoredMerge(LEFT_T, BASE, RIGHT_T)
++        self.assertEqual(list(m.result), BASE)
++        self.assertEqual(m.counts(), (4, 4, 1))
++        self.assertEqual(m.side_state(0, LEFT), SideState.UNRESOLVED)
++        self.assertEqual(m.side_state(0, RIGHT), SideState.NONE)
++
++
++class ApplyTests(unittest.TestCase):
++
++    def setUp(self):
++        self.m = AnchoredMerge(LEFT_T, BASE, RIGHT_T)
++
++    def test_apply_left_only_change(self):
++        do_edit(self.m, self.m.apply(0, LEFT))
++        self.assertEqual(self.m.side_state(0, LEFT), SideState.APPLIED)
++        self.assertTrue(self.m.is_resolved(0))
++        self.assertEqual(self.m.counts(), (4, 3, 1))
++
++    def test_undo_returns_the_change_to_unresolved(self):
++        do_edit(self.m, self.m.apply(0, LEFT))
++        start, end = self.m.ranges[0]
++        do_edit(self.m, Edit(start, end, ["c"]))  # what undo restores
++        self.assertEqual(self.m.side_state(0, LEFT), SideState.UNRESOLVED)
++
++    def test_same_on_both_applies_once(self):
++        do_edit(self.m, self.m.apply(1, LEFT))
++        self.assertEqual(self.m.side_state(1, LEFT), SideState.APPLIED)
++        self.assertEqual(self.m.side_state(1, RIGHT), SideState.APPLIED)
++        self.assertEqual(list(self.m.result).count("X"), 1)
++
++    def test_conflict_left_then_right_appends(self):
++        do_edit(self.m, self.m.apply(2, LEFT))
++        self.assertEqual(self.m.side_state(2, LEFT), SideState.APPLIED)
++        self.assertEqual(self.m.side_state(2, RIGHT), SideState.UNRESOLVED)
++        do_edit(self.m, self.m.apply(2, RIGHT))
++        self.assertEqual(self.m.result_lines(2), ["H", "h2"])
++        self.assertTrue(self.m.is_resolved(2))
++
++    def test_conflict_right_then_left_appends(self):
++        do_edit(self.m, self.m.apply(2, RIGHT))
++        do_edit(self.m, self.m.apply(2, LEFT))
++        self.assertEqual(self.m.result_lines(2), ["h2", "H"])
++        self.assertTrue(self.m.is_resolved(2))
++
++    def test_conflict_arrow_after_hand_edit_keeps_the_typed_text(self):
++        start, end = self.m.ranges[2]
++        do_edit(self.m, Edit(start, end, ["mine"]))
++        edit = self.m.apply(2, LEFT)
++        self.assertEqual(edit.lines, ["mine", "H"])
++
++    def test_apply_all_non_conflicting(self):
++        edits = self.m.apply_non_conflicting('all')
++        self.assertEqual(len(edits), 3)
++        for edit in edits:
++            do_edit(self.m, edit)
++        self.assertEqual(list(self.m.result), lines("a b C d e X f g h i J"))
++        self.assertEqual(self.m.counts(), (4, 1, 1))
++
++    def test_apply_left_non_conflicting_skips_right_only(self):
++        for edit in self.m.apply_non_conflicting('left'):
++            do_edit(self.m, edit)
++        self.assertTrue(self.m.is_resolved(0))
++        self.assertTrue(self.m.is_resolved(1))
++        self.assertFalse(self.m.is_resolved(3))
++
++    def test_incremental_mapping_matches_a_fresh_model(self):
++        for edit in self.m.apply_non_conflicting('all'):
++            do_edit(self.m, edit)
++        do_edit(self.m, self.m.apply(2, RIGHT))
++        do_edit(self.m, Edit(0, 0, ["typed"]))
++        fresh = AnchoredMerge(LEFT_T, BASE, RIGHT_T, list(self.m.result))
++        self.assertEqual(self.m.ranges, fresh.ranges)
++
++
++class DismissTests(unittest.TestCase):
++
++    def setUp(self):
++        self.m = AnchoredMerge(LEFT_T, BASE, RIGHT_T)
++
++    def test_dismiss_keeps_base_and_counts_as_handled(self):
++        self.m.dismiss(0, LEFT)
++        self.assertEqual(self.m.side_state(0, LEFT), SideState.DISMISSED)
++        self.assertTrue(self.m.is_resolved(0))
++        self.assertEqual(list(self.m.result), BASE)
++
++    def test_dismissal_lapses_when_the_text_changes_and_holds_when_it_returns(self):
++        self.m.dismiss(0, LEFT)
++        start, end = self.m.ranges[0]
++        do_edit(self.m, Edit(start, end, ["typed"]))
++        self.assertEqual(self.m.side_state(0, LEFT), SideState.UNRESOLVED)
++        start, end = self.m.ranges[0]
++        do_edit(self.m, Edit(start, end, ["c"]))
++        self.assertEqual(self.m.side_state(0, LEFT), SideState.DISMISSED)
++
++    def test_x_on_hand_edited_text_keeps_it(self):
++        start, end = self.m.ranges[0]
++        do_edit(self.m, Edit(start, end, ["typed"]))
++        self.m.dismiss(0, LEFT)
++        self.assertTrue(self.m.is_resolved(0))
++        self.assertEqual(self.m.result_lines(0), ["typed"])
++
++    def test_conflict_needs_both_sides_handled(self):
++        do_edit(self.m, self.m.apply(2, LEFT))
++        self.assertFalse(self.m.is_resolved(2))
++        self.m.dismiss(2, RIGHT)
++        self.assertTrue(self.m.is_resolved(2))
++        self.assertEqual(self.m.result_lines(2), ["H"])
++
++    def test_dismissing_a_same_on_both_change_covers_both_sides(self):
++        self.m.dismiss(1, RIGHT)
++        self.assertTrue(self.m.is_resolved(1))
++
++
++class ReopenTests(unittest.TestCase):
++
++    def test_states_come_back_from_a_half_done_result(self):
++        # Saved earlier: left-only applied, conflict took the right side,
++        # the same-on-both insert was dismissed (base kept).
++        saved = lines("a b C d e f g h2 i j")
++        m = AnchoredMerge(LEFT_T, BASE, RIGHT_T, saved)
++        self.assertEqual(m.side_state(0, LEFT), SideState.APPLIED)
++        self.assertEqual(m.side_state(1, LEFT), SideState.UNRESOLVED)
++        self.assertEqual(m.side_state(2, RIGHT), SideState.APPLIED)
++        self.assertEqual(m.side_state(2, LEFT), SideState.UNRESOLVED)
++        self.assertEqual(m.side_state(3, RIGHT), SideState.UNRESOLVED)
++        self.assertEqual(m.counts(), (4, 3, 1))
++
++    def test_hand_edited_conflict_stays_unresolved_with_its_text(self):
++        saved = lines("a b c d e f g mine i j")
++        m = AnchoredMerge(LEFT_T, BASE, RIGHT_T, saved)
++        self.assertEqual(m.result_lines(2), ["mine"])
++        self.assertFalse(m.is_resolved(2))
++
++
++class BoundaryAndSlideTests(unittest.TestCase):
++
++    def test_insert_on_a_shared_boundary_belongs_to_the_earlier_group(self):
++        base = lines("a b c d")
++        left = lines("a B c d")        # changes b
++        right = lines("a b C d")       # changes c, right after
++        m = AnchoredMerge(left, base, right)
++        self.assertEqual([g.kind for g in m.groups], [Kind.LEFT, Kind.RIGHT])
++        # Type a new line between them: it joins the first group.
++        do_edit(m, Edit(2, 2, ["typed"]))
++        self.assertEqual(m.result_lines(0), ["b", "typed"])
++        self.assertEqual(m.result_lines(1), ["c"])
++
++    def test_block_ending_in_brace_after_a_brace_applies_in_one_click(self):
++        base = ["f() {", "  a();", "}", "", "g() {", "}"]
++        left = ["f() {", "  a();", "}", "", "h() {", "}", "", "g() {", "}"]
++        m = AnchoredMerge(left, base, base)
++        edit = m.apply(0, LEFT)
++        do_edit(m, edit)
++        self.assertEqual(list(m.result), left)
++        self.assertEqual(m.side_state(0, LEFT), SideState.APPLIED)
++        self.assertEqual(m.apply_non_conflicting('all'), [])
++
++    def test_block_repeating_its_surroundings_applies_in_one_click(self):
++        base = lines("x y z")
++        left = lines("x y x y z")
++        m = AnchoredMerge(left, base, base)
++        do_edit(m, m.apply(0, LEFT))
++        self.assertEqual(list(m.result), left)
++        self.assertEqual(m.side_state(0, LEFT), SideState.APPLIED)
++
++    def test_deletion_of_a_repeated_line_applies_in_one_click(self):
++        base = lines("a b b b c")
++        left = lines("a b b c")
++        m = AnchoredMerge(left, base, base)
++        do_edit(m, m.apply(0, LEFT))
++        self.assertEqual(list(m.result), left)
++        self.assertTrue(m.is_resolved(0))
++
++    def test_slides_stop_at_differing_lines(self):
++        m = AnchoredMerge(lines("a"), lines("a"), lines("a"), lines("a x x b"))
++        chunks = m._chunks()
++        self.assertEqual(len(chunks), 1)
++        slid = m._slides(chunks, 0)
++        # Inserted "x x" (or "x b") can only move over the matching "x".
++        self.assertTrue(all(abs(c[2] - chunks[0][2]) <= 1 for c in slid))
++
++
++class RandomMergeTests(unittest.TestCase):
++    """Seeded random merges with code-like lines: many distinct lines plus
++    the look-alikes ("}", "{", blank) that make line diffs ambiguous."""
++
++    ALPHABET = ["}", "", "{", "}"] + [f"line{i}" for i in range(25)]
++
++    def mutate(self, rnd, base):
++        text = list(base)
++        for _ in range(rnd.randint(1, 3)):
++            op, pos = rnd.choice("ird"), rnd.randint(0, len(text))
++            if op == "i":
++                text[pos:pos] = [rnd.choice(self.ALPHABET) for _ in range(rnd.randint(1, 3))]
++            elif op == "r" and pos < len(text):
++                text[pos] = rnd.choice(self.ALPHABET)
++            elif op == "d" and pos < len(text):
++                del text[pos:pos + rnd.randint(1, 2)]
++        return text
++
++    def merges(self, seed, count):
++        rnd = random.Random(seed)
++        for _ in range(count):
++            base = [rnd.choice(self.ALPHABET) for _ in range(rnd.randint(5, 40))]
++            yield rnd, base, self.mutate(rnd, base), self.mutate(rnd, base)
++
++    def test_every_arrow_shows_its_change_applied(self):
++        for rnd, base, left, right in self.merges(7, 300):
++            m = AnchoredMerge(left, base, right)
++            order = list(range(len(m.groups)))
++            rnd.shuffle(order)
++            for i in order:
++                group = m.groups[i]
++                sides = [s for s in (LEFT, RIGHT) if group.sides[s] is not None]
++                if group.kind == Kind.BOTH:
++                    sides = [LEFT]
++                rnd.shuffle(sides)
++                for side in sides:
++                    if m.side_state(i, side) == SideState.UNRESOLVED:
++                        do_edit(m, m.apply(i, side))
++                        self.assertEqual(m.side_state(i, side), SideState.APPLIED,
++                                         (base, left, right))
++            self.assertEqual(m.counts()[1], 0, (base, left, right))
++            fresh = AnchoredMerge(left, base, right, list(m.result))
++            self.assertEqual(fresh.ranges, m.ranges, (base, left, right))
++
++    def test_undoing_an_arrow_brings_the_change_back(self):
++        for rnd, base, left, right in self.merges(11, 300):
++            m = AnchoredMerge(left, base, right)
++            for i, group in enumerate(m.groups):
++                side = RIGHT if group.kind == Kind.RIGHT else LEFT
++                edit = m.apply(i, side)
++                old = list(m.result[edit.start:edit.end])
++                do_edit(m, edit)
++                do_edit(m, Edit(edit.start, edit.start + len(edit.lines), old))
++                self.assertEqual(list(m.result), base, (base, left, right))
++                self.assertEqual(m.side_state(i, side), SideState.UNRESOLVED,
++                                 (base, left, right))
++
++
++class WandTests(unittest.TestCase):
++
++    def test_wand_merges_edits_to_different_lines_of_one_block(self):
++        base = lines("a b c d")
++        left = lines("a B C d")
++        right = lines("a b C D")
++        m = AnchoredMerge(left, base, right)
++        conflicts = [g.index for g in m.groups if g.kind == Kind.CONFLICT]
++        self.assertTrue(conflicts)
++        for edit in m.wand_all():
++            do_edit(m, edit)
++        self.assertEqual(list(m.result), lines("a B C D"))
++        self.assertEqual(m.counts()[1], 0)
++
++    def test_wand_merges_word_edits_on_one_line(self):
++        base = ["<Container className={cn('flex flex-col gap-6 py-10')}>"]
++        left = ["<Container className={cn('py-10')}>"]
++        right = ["<Container className={cn('flex flex-col gap-6 py-10 lg:flex-row')}>"]
++        self.assertEqual(wand_merge(left, base, right),
++                         ["<Container className={cn('py-10 lg:flex-row')}>"])
++
++    def test_wand_keeps_one_sides_reindent_with_the_others_word_change(self):
++        base = ["<Heading level={1}>", "  {heading}"]
++        left = ["  <Heading level={1}>", "    {heading}"]
++        right = ["<Heading level={2}>", "  {heading}"]
++        self.assertEqual(wand_merge(left, base, right),
++                         ["  <Heading level={2}>", "    {heading}"])
++
++    def test_wand_gives_up_on_a_true_conflict(self):
++        m = AnchoredMerge(lines("a L c"), lines("a b c"), lines("a R c"))
++        self.assertIsNone(m.wand(0))
++        self.assertEqual(m.wand_all(), [])
++
++    def test_wand_waits_until_nothing_was_done(self):
++        base = lines("a b c d")
++        m = AnchoredMerge(lines("a B C d"), base, lines("a b C D"))
++        index = next(g.index for g in m.groups if g.kind == Kind.CONFLICT)
++        do_edit(m, m.apply(index, LEFT))
++        self.assertIsNone(m.wand(index))
++
++
++class DifferTests(unittest.TestCase):
++
++    def make(self, left, base, right, result=None):
++        differ = AnchoredMergeDiffer()
++        differ.base_lines = base
++        result = list(base if result is None else result)
++        for _ in differ.set_sequences_iter([left, result, right]):
++            pass
++        return differ
++
++    def tags(self, differ, side):
++        return [pair[side].tag for pair in differ.all_changes()
++                if pair[side] is not None]
++
++    def test_initial_tags(self):
++        d = self.make(LEFT_T, BASE, RIGHT_T)
++        self.assertEqual(self.tags(d, LEFT), ['replace', 'insert', 'conflict'])
++        self.assertEqual(self.tags(d, RIGHT), ['insert', 'conflict', 'replace'])
++        self.assertEqual(len(d.conflicts), 1)
++
++    def test_applied_change_leaves_a_resolved_chunk_on_the_other_side(self):
++        d = self.make(LEFT_T, BASE, RIGHT_T)
++        do_edit(d, d.model.apply(0, LEFT), sides=(LEFT_T, RIGHT_T))
++        # No left chunk any more for c; the right pane now differs there and
++        # keeps a chunk, so the panes stay aligned, tagged resolved.
++        right_chunks = [p[1] for p in d.all_changes() if p[1] is not None]
++        self.assertIn('resolved', [c.tag for c in right_chunks])
++        self.assertEqual(self.tags(d, LEFT), ['insert', 'conflict'])
++
++    def test_every_difference_keeps_a_chunk(self):
++        d = self.make(LEFT_T, BASE, RIGHT_T)
++        for edit in d.model.apply_non_conflicting('all'):
++            do_edit(d, edit, sides=(LEFT_T, RIGHT_T))
++        result = list(d.model.result)
++        plain = AnchoredMergeDiffer()  # no base: Meld's own chunks
++        for _ in plain.set_sequences_iter([LEFT_T, result, RIGHT_T]):
++            pass
++        strip = lambda pairs: [tuple(c[1:] if c else None for c in p) for p in pairs]
++        self.assertEqual(strip(d.all_changes()), strip(plain.all_changes()))
++
++    def test_conflict_count_follows_the_model(self):
++        d = self.make(LEFT_T, BASE, RIGHT_T)
++        do_edit(d, d.model.apply(2, LEFT), sides=(LEFT_T, RIGHT_T))
++        self.assertEqual(len(d.conflicts), 1)  # right side still open
++        d.model.dismiss(2, RIGHT)
++        d.refresh([LEFT_T, list(d.model.result), RIGHT_T])
++        self.assertEqual(len(d.conflicts), 0)
++
++    def test_hand_edit_outside_any_group_gets_a_plain_tag(self):
++        d = self.make(LEFT_T, BASE, RIGHT_T)
++        do_edit(d, Edit(0, 0, ["typed"]), sides=(LEFT_T, RIGHT_T))
++        first = next(iter(d.all_changes()))
++        self.assertEqual([c.tag for c in first if c], ['delete', 'delete'])
++
++
++class HelpersTests(unittest.TestCase):
++
++    def test_merge3(self):
++        self.assertEqual(merge3(lines("a B c"), lines("a b c"), lines("a b C")),
++                         lines("a B C"))
++        self.assertEqual(merge3(lines("x"), lines("b"), lines("x")), lines("x"))
++        self.assertIsNone(merge3(lines("L"), lines("b"), lines("R")))
++
++    def test_exit_status(self):
++        self.assertEqual(exit_status(True, False), 0)
++        self.assertEqual(exit_status(True, True), 1)
++        self.assertEqual(exit_status(False, False), 1)
++
++    def test_apply_edits_last_first(self):
++        edits = [Edit(3, 4, ["D"]), Edit(0, 1, ["A", "A2"])]
++        self.assertEqual(apply_edits(lines("a b c d"), edits),
++                         lines("A A2 b c D"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

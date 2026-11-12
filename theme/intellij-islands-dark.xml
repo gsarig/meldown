@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Meld colour scheme matching PhpStorm's "Islands Dark" theme, so Meld's merge
+  view looks like the IntelliJ merge tool it replaces.
+
+  Editor and syntax colours come from Islands Dark
+  (platform/platform-resources/src/themes/islands/IslandSchemeDark.xml in
+  JetBrains' open-source intellij-community repository, Apache License 2.0).
+  Islands Dark sets no diff colours of its own and inherits them from Darcula
+  (platform/platform-resources/src/DefaultColorSchemesManager.xml in the same
+  repository), so the meld:* styles use Darcula's DIFF_* values: BACKGROUND as
+  the chunk fill and ERROR_STRIPE_COLOR as the chunk outline. See NOTICE.
+
+  Meld reads its meld:* styles from the selected scheme first and falls back to
+  its own meld-dark scheme for any it cannot find here.
+
+  Installed by copying into ~/.local/share/gtksourceview-4/styles (README.md).
+-->
+<style-scheme id="intellij-islands-dark" name="IntelliJ Islands Dark" version="1.0">
+  <author>Giorgos Sarigiannidis</author>
+  <description>PhpStorm Islands Dark editor colours with IntelliJ's diff colours</description>
+
+  <!-- Editor -->
+  <style name="text" foreground="#bcbec4" background="#191a1c"/>
+  <style name="selection" background="#214283"/>
+  <style name="selection-unfocused" background="#2b2d30"/>
+  <style name="cursor" foreground="#ced0d6"/>
+  <style name="current-line" background="#1f2024"/>
+  <style name="line-numbers" foreground="#4b5059" background="#191a1c"/>
+  <style name="current-line-number" foreground="#a1a3ab" background="#1f2024"/>
+  <style name="right-margin" foreground="#323438" background="#323438"/>
+  <style name="draw-spaces" foreground="#6f737a"/>
+  <style name="bracket-match" background="#43454a" bold="true"/>
+  <style name="bracket-mismatch" foreground="#f75464" underline="error"/>
+  <style name="search-match" background="#2d543f"/>
+
+  <!-- Syntax -->
+  <style name="def:comment" foreground="#7a7e85"/>
+  <style name="def:shebang" foreground="#7a7e85"/>
+  <style name="def:doc-comment" foreground="#5f826b" italic="true"/>
+  <style name="def:doc-comment-element" foreground="#67a37c" underline="single"/>
+  <style name="def:keyword" foreground="#cf8e6d"/>
+  <style name="def:statement" foreground="#cf8e6d"/>
+  <style name="def:type" foreground="#cf8e6d"/>
+  <style name="def:builtin" foreground="#cf8e6d"/>
+  <style name="def:boolean" foreground="#cf8e6d"/>
+  <style name="def:string" foreground="#6aab73"/>
+  <style name="def:character" foreground="#6aab73"/>
+  <style name="def:special-char" foreground="#cf8e6d"/>
+  <style name="def:number" foreground="#2aacb8"/>
+  <style name="def:floating-point" foreground="#2aacb8"/>
+  <style name="def:decimal" foreground="#2aacb8"/>
+  <style name="def:base-n-integer" foreground="#2aacb8"/>
+  <style name="def:constant" foreground="#c77dbb" italic="true"/>
+  <style name="def:special-constant" foreground="#c77dbb" italic="true"/>
+  <style name="def:function" foreground="#56a8f5"/>
+  <style name="def:identifier" foreground="#bcbec4"/>
+  <style name="def:operator" foreground="#bcbec4"/>
+  <style name="def:preprocessor" foreground="#b3ae60"/>
+  <style name="def:error" foreground="#f75464" underline="error"/>
+  <style name="def:net-address" foreground="#56a8f5" underline="single"/>
+  <style name="xml:element-name" foreground="#d5b778"/>
+  <style name="xml:tag" foreground="#d5b778"/>
+  <style name="xml:attribute-name" foreground="#bcbec4"/>
+
+  <!-- Meld diff colours (Darcula DIFF_* fill, stripe colour as outline) -->
+  <style name="meld:insert" background="#294436" foreground="#447152" line-background="#447152"/>
+  <style name="meld:replace" background="#385570" foreground="#43698d" line-background="#43698d"/>
+  <style name="meld:conflict" background="#45302b" foreground="#8f5247" line-background="#8f5247"/>
+  <style name="meld:delete" background="#484a4a" foreground="#656e76" line-background="#656e76"/>
+  <style name="meld:error" background="#402929" foreground="#f75464" line-background="#8f5247"/>
+  <!-- Not Darcula: a change already handled in the patched merge view,
+       kept quiet against the editor background -->
+  <style name="meld:resolved" background="#222326" foreground="#4b5059" line-background="#3a3c41"/>
+  <style name="meld:inline" background="#43698d"/>
+  <style name="meld:current-line-highlight" foreground="#eeeeee" background="#rgba(17, 17, 0, 0.25)"/>
+  <style name="meld:unknown-text" foreground="#6f737a"/>
+  <style name="meld:syncpoint-outline" foreground="#a1a3ab"/>
+  <style name="meld:current-chunk-highlight" background="#rgba(255, 255, 255, 0.06)"/>
+  <style name="meld:overscroll" background="#rgba(255, 255, 255, 0.05)"/>
+  <style name="meld:dimmed" foreground="#6f737a"/>
+  <style name="map-overlay" background="#rgba(200, 200, 200, 0.25)"/>
+</style-scheme>
