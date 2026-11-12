@@ -11,6 +11,8 @@ Stock Meld opens a three-way merge with the result already half-merged, and ever
 - **Branch names as pane titles**, from the wrapper, for merges, rebases and cherry-picks.
 - **An honest exit status.** Meld exits 0 only when the result was saved with nothing left unresolved, so with `trustExitCode` git never marks a half-done file as resolved.
 
+The workflow is inspired by the merge tool in JetBrains IDEs.
+
 Tested on Ubuntu 24.04 under WSL 2 (WSLg). Other Linux distributions should work the same way.
 
 ## What is here
