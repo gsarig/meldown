@@ -1,7 +1,7 @@
 From c8bb9777e01b8f1a976f958dab95dff3c2c4fee3 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Wed, 11 Nov 2026 19:40:32 +0200
-Subject: [PATCH 1/6] Show the count of conflicts left in the merge pane's
+Subject: [PATCH 1/7] Show the count of conflicts left in the merge pane's
  status bar
 
 Meld tracks the conflicts it could not merge but never shows how many

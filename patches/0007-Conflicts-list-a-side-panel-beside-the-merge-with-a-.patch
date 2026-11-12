@@ -1,0 +1,843 @@
+From a25b2b8a1eb0f167be82a517bb45da3b72610cfc Mon Sep 17 00:00:00 2001
+From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
+Date: Thu, 12 Nov 2026 20:33:25 +0200
+Subject: [PATCH 7/7] Conflicts list: a side panel beside the merge, with a
+ layout switch
+
+The Conflicts list can sit in a side panel next to the file being merged,
+as well as in a tab of its own. A switch in the header bar flips between
+the two at any time; the conflicts-layout setting picks the starting one
+(tabs by default). Only the list moves: the merge tabs stay notebook pages
+in both layouts, with their tab strip hidden in the side view, since a
+merge view moved to another container re-runs one-time setup in its
+widgets.
+
+In the side view, clicking a file shows its merge, open files carry a dot,
+Accept yours and Accept theirs show on the selected row and on hover, and
+saving opens the next unresolved file (Save and next file). From the list,
+saving never closes the window. Closing the window asks the list after
+every tab and only when all agreed, since its close ends Meld with its exit
+status; both decisions are pure functions tested in test_conflicts.
+---
+ data/org.gnome.Meld.gschema.xml |   9 +
+ meld/anchoredview.py            |  34 +++-
+ meld/conflicts.py               |  18 ++
+ meld/conflictsview.py           | 315 ++++++++++++++++++++++++++++++--
+ meld/meldwindow.py              |  37 +++-
+ meld/resources/ui/appwindow.ui  |  62 ++++++-
+ meld/ui/notebook.py             |  12 +-
+ test/test_conflicts.py          |  22 +++
+ 8 files changed, 470 insertions(+), 39 deletions(-)
+
+diff --git a/data/org.gnome.Meld.gschema.xml b/data/org.gnome.Meld.gschema.xml
+index d503a0c..2fd79a6 100644
+--- a/data/org.gnome.Meld.gschema.xml
++++ b/data/org.gnome.Meld.gschema.xml
+@@ -84,6 +84,15 @@
+           <summary>Highlight syntax</summary>
+           <description>Whether to highlight syntax in comparisons. Because of Meld’s own color highlighting, this is off by default.</description>
+       </key>
++      <key name="conflicts-layout" type="s">
++          <choices>
++              <choice value="tabs"/>
++              <choice value="side"/>
++          </choices>
++          <default>"tabs"</default>
++          <summary>Where the Conflicts list opens (local patch)</summary>
++          <description>"tabs" opens the list of conflicted files in a tab of its own, each file in another tab; "side" keeps the list in a side panel beside the file being merged. The switch in the header bar changes only the open window.</description>
++      </key>
+       <key name="style-scheme" type="s">
+           <default>"classic"</default>
+           <summary>Color scheme to use for syntax highlighting</summary>
+diff --git a/meld/anchoredview.py b/meld/anchoredview.py
+index 4a1fb66..b202c13 100644
+--- a/meld/anchoredview.py
++++ b/meld/anchoredview.py
+@@ -75,6 +75,8 @@ class AnchoredView:
+         self.saved_resolved = False
+         self.edited_since_save = True
+         self._close_after_save = False
++        self.from_list = False
++        self._confirm_button = '_Save and close anyway'
+         self._confirm_text = ('If you save and close now, the file stays '
+                               'unresolved and git mergetool will ask '
+                               'whether to go on to the next file.')
+@@ -198,12 +200,24 @@ class AnchoredView:
+             self._close_after_save = False
+             GLib.idle_add(self._close)
+ 
+-    def set_from_list(self):
+-        """Opened from the Conflicts tab (meld/conflictsview.py): closing
+-        returns to the list, which stages the file once it is resolved."""
+-        self.save_button.set_label('Save and back to list')
+-        self._confirm_text = ('If you save and go back now, the file stays '
+-                              'unresolved in the list.')
++    def set_from_list(self, layout: str = 'tabs', has_next: bool = False):
++        """Opened from the Conflicts list (meld/conflictsview.py): closing
++        never closes the window and returns to the list, which stages the
++        file once it is resolved. In the side view the list never goes
++        away and saving opens the next unresolved file, so the button says
++        that instead; the list calls this again when the layout changes."""
++        self.from_list = True
++        if layout == 'side':
++            label = 'Save and next file' if has_next else 'Save'
++            confirm = 'If you save now, the file stays unresolved in the list.'
++            self._confirm_button = '_Save anyway'
++        else:
++            label = 'Save and back to list'
++            confirm = ('If you save and go back now, the file stays '
++                       'unresolved in the list.')
++            self._confirm_button = '_Save and close anyway'
++        self.save_button.set_label(label)
++        self._confirm_text = confirm
+ 
+     def save_and_close(self):
+         """Save the result, then close: the whole window when this is its
+@@ -225,7 +239,7 @@ class AnchoredView:
+         response = misc.modal_dialog(
+             primary, secondary,
+             (('_Keep resolving', Gtk.ResponseType.CANCEL, None),
+-             ('_Save and close anyway', Gtk.ResponseType.OK,
++             (self._confirm_button, Gtk.ResponseType.OK,
+               'destructive-action')),
+             parent=self.fd, messagetype=Gtk.MessageType.QUESTION)
+         return response == Gtk.ResponseType.OK
+@@ -233,7 +247,11 @@ class AnchoredView:
+     def _close(self):
+         window = self.fd.get_toplevel()
+         notebook = getattr(window, 'notebook', None)
+-        if notebook is not None and notebook.get_n_pages() == 1:
++        # From the Conflicts list, closing returns to the list: in the side
++        # view the notebook holds only merges, so one open file would
++        # otherwise close Meld.
++        if (not self.from_list and notebook is not None
++                and notebook.get_n_pages() == 1):
+             window.close()
+         else:
+             self.fd.on_delete_event()
+diff --git a/meld/conflicts.py b/meld/conflicts.py
+index 993fd78..f6a5384 100644
+--- a/meld/conflicts.py
++++ b/meld/conflicts.py
+@@ -119,3 +119,21 @@ def auto_resolve(contents: Dict[int, bytes]) -> Optional[bytes]:
+     if model.counts()[1]:
+         return None
+     return join_lines(result, newline).encode('utf-8')
++
++
++# -- closing the window with the list in the side view ----------------------
++# Kept here, without GTK, so they can be tested; meld/meldwindow.py uses them.
++
++def ask_list_on_close(responses: List[int], ok: int) -> bool:
++    """Whether a window closing with the Conflicts list in its side area
++    should ask the list too. Only when every tab agreed to close: the list
++    reports Meld's exit status and lets the application end, which must not
++    happen while a cancelled or still-saving tab keeps the window open."""
++    return all(response == ok for response in responses)
++
++
++def is_notebook_page(page_num: int) -> bool:
++    """Whether a closing document is a notebook tab. The list in the side
++    area is not, and its page number is -1, which Gtk.Notebook.remove_page
++    would read as "the last tab"."""
++    return page_num >= 0
+diff --git a/meld/conflictsview.py b/meld/conflictsview.py
+index d0abac5..b75d534 100644
+--- a/meld/conflictsview.py
++++ b/meld/conflictsview.py
+@@ -22,6 +22,13 @@ finish. A file opens in the anchored merge view (meld/anchoredview.py) in
+ a tab of its own; saving it with nothing unresolved stages it and brings
+ the list back.
+ 
++The list has two layouts, switched from the header bar and started from
++the conflicts-layout setting: "tabs", the list as a tab of its own, and
++"side", the list in the window's side area (meld/meldwindow.py) beside the
++merge tabs, whose tab strip is then hidden. Only the list moves between
++them: the merge tabs stay notebook pages either way, since a merge view
++moved to another container re-runs one-time setup in its widgets.
++
+ The column titles and the header come from the wrapper script through
+ MELD_CONFLICTS_YOURS, MELD_CONFLICTS_THEIRS and MELD_CONFLICTS_HEADER, so
+ the branch naming (which flips in a rebase) lives in one place.
+@@ -35,7 +42,7 @@ import subprocess
+ import tempfile
+ from typing import Dict, Optional, Set
+ 
+-from gi.repository import Gio, GLib, Gtk, Pango
++from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+ 
+ from meld import misc
+ from meld.conflicts import (
+@@ -51,6 +58,7 @@ from meld.conflicts import (
+ )
+ from meld.melddoc import MeldDoc
+ from meld.recent import RecentType
++from meld.settings import get_settings
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -100,6 +108,11 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         self.outcome: Dict[str, str] = {}  # how a resolved file was done
+         self.tabs: Dict[str, object] = {}  # path -> its merge FileDiff
+         self.finished = False
++        self.layout = get_settings().get_string('conflicts-layout')
++        self._applied = 'tabs'   # where the list is now; start() moves it
++        self._quiet = False      # selection set by code, not by a click
++        self._handlers = []      # (object, handler id) to drop on close
++        self.switch_box = None
+ 
+         self._build()
+         self.show_all()
+@@ -119,9 +132,130 @@ class ConflictsView(Gtk.Box, MeldDoc):
+ 
+     def on_delete_event(self):
+         self.scheduler.remove_all_tasks()
++        for obj, handler in self._handlers:
++            obj.disconnect(handler)
++        self._handlers = []
++        if self.switch_box is not None:
++            self.window.header_bar.remove(self.switch_box)
++            self.switch_box = None
+         self.close_signal.emit(self.exit_status())
+         return Gtk.ResponseType.OK
+ 
++    # -- the two layouts -------------------------------------------------------
++
++    def start(self):
++        """Called once the window has given the list its tab: add the
++        layout switch to the header bar and move to the starting layout."""
++        self.switch_box = Gtk.Box()
++        self.switch_box.get_style_context().add_class('linked')
++        self.side_toggle = Gtk.RadioButton.new_with_label(None, '◧ Side panel')
++        self.tabs_toggle = Gtk.RadioButton.new_with_label_from_widget(
++            self.side_toggle, '▭ Tabs')
++        for button, layout in ((self.side_toggle, 'side'),
++                               (self.tabs_toggle, 'tabs')):
++            button.set_mode(False)
++            button.set_tooltip_text(
++                'Show the conflicted files in a side panel' if layout == 'side'
++                else 'Show the conflicted files in a tab of their own')
++            button.connect('toggled', self._on_toggled, layout)
++            self.switch_box.pack_start(button, False, False, 0)
++        self.window.header_bar.pack_start(self.switch_box)
++        # First in the header bar: the buttons after it change with the
++        # page shown, and the switch must stay put in both layouts.
++        self.window.header_bar.child_set_property(
++            self.switch_box, 'position', 0)
++        self.switch_box.show_all()
++        notebook = self.window.notebook
++        self._handlers = [
++            (self.window, self.window.connect(
++                'notify::is-active', self._on_window_active)),
++            (notebook, notebook.connect_after(
++                'switch-page', self._on_switch_page)),
++        ]
++        self.set_layout(self.layout)
++
++    def _on_toggled(self, button, layout):
++        if button.get_active():
++            self.set_layout(layout)
++
++    def set_layout(self, layout: str):
++        """Move the list between its own tab and the side area. The merge
++        tabs never move; in the side view their tab strip is hidden and
++        the list picks which one shows."""
++        layout = 'side' if layout == 'side' else 'tabs'
++        self.layout = layout
++        toggle = self.side_toggle if layout == 'side' else self.tabs_toggle
++        if not toggle.get_active():
++            toggle.set_active(True)
++        if layout == self._applied:
++            return
++        window, notebook = self.window, self.window.notebook
++        if layout == 'side':
++            num = notebook.page_num(self)
++            if num >= 0:
++                if notebook.get_current_page() == num:
++                    self.on_container_switch_out_event(window)
++                notebook.remove_page(num)
++            window.side_area.pack_start(self, True, True, 0)
++            window.side_area.show()
++            window.side_doc = self
++            notebook.set_tabs_hidden(True)
++        else:
++            window.side_area.remove(self)
++            window.side_area.hide()
++            window.side_doc = None
++            notebook.set_tabs_hidden(False)
++            window.add_notebook_page(self, 0)
++            notebook.on_label_changed(self, self.label_text, self.tooltip_text)
++            window.content_stack.set_visible_child_name('notebook')
++            notebook.set_current_page(notebook.page_num(self))
++        self._applied = layout
++        self.merge_button.set_visible(layout == 'tabs')
++        self.refresh()
++        if layout == 'side':
++            if not self.tabs:
++                path = self._next_mergeable()
++                if path is not None:
++                    self.open_merge(path)
++            self._update_stack()
++
++    def _side(self) -> bool:
++        return self._applied == 'side'
++
++    def _update_stack(self, note: Optional[str] = None):
++        """In the side view, show the open merge, or a note when none is."""
++        if not self._side():
++            return
++        stack = self.window.content_stack
++        if self.window.notebook.get_n_pages() and note is None:
++            stack.set_visible_child_name('notebook')
++            return
++        if note is None:
++            note = ('Select a file to merge it' if self._unresolved() else
++                    'Nothing left to resolve: Accept and finish stages the '
++                    'files and closes Meld')
++        stack.get_child_by_name('placeholder').set_text(note)
++        stack.set_visible_child_name('placeholder')
++        if not self.window.notebook.get_n_pages():
++            # No merge is shown, so the header bar shows the list's own
++            # buttons, as switching to the Conflicts tab does.
++            MeldDoc.on_container_switch_in_event(self, self.window)
++
++    def _on_window_active(self, window, *args):
++        # In the side view the list is never switched to, which is what
++        # refreshes it in the tab view, so git commands run elsewhere show
++        # up when the window gets focus back.
++        if self._side() and window.is_active() and not window.closing:
++            self.refresh()
++
++    def _on_switch_page(self, notebook, page, page_num):
++        if not self._side():
++            return
++        path = next((p for p, doc in self.tabs.items() if doc is page), None)
++        if path is not None:
++            self._select(path)
++        self._update_marks()
++
+     def exit_status(self) -> int:
+         if self.finished:
+             return 0
+@@ -152,7 +286,7 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+         self.listbox.set_activate_on_single_click(False)
+         self.listbox.connect('row-activated', self.on_row_activated)
+-        self.listbox.connect('row-selected', lambda *a: self._update_buttons())
++        self.listbox.connect('row-selected', self._on_row_selected)
+         scroller = Gtk.ScrolledWindow()
+         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+         scroller.add(self.listbox)
+@@ -189,6 +323,8 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         row.set_selectable(selectable)
+         row.set_activatable(selectable)
+         row.path = path
++        row.accept_box = None
++        row.name_label = None
+         box = Gtk.Box(spacing=8)
+         box.props.margin = 6
+         for widget, expand in children:
+@@ -231,6 +367,93 @@ class ConflictsView(Gtk.Box, MeldDoc):
+             text += '  ' + _dim(folder)
+         return self._label(text)
+ 
++    def _side_row(self, path, note=None, accept=False, selectable=True):
++        """A compact row for the side view: the file name with its folder
++        under it, and for an unresolved file Accept yours / Accept theirs,
++        shown on the selected row and on hover."""
++        folder, name = os.path.split(path)
++        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
++        name_label = self._label(GLib.markup_escape_text(name))
++        text.pack_start(name_label, False, False, 0)
++        sub = ' · '.join(x for x in (folder, note) if x)
++        if sub:
++            text.pack_start(self._label(_dim(sub)), False, False, 0)
++        children = [(text, True)]
++        accept_box = None
++        if accept:
++            accept_box = Gtk.Box(spacing=6)
++            for stage, label in ((OURS, 'Accept yours'), (THEIRS, 'Accept theirs')):
++                button = Gtk.Button.new_with_label(label)
++                button.connect('clicked', lambda *a, s=stage: self.accept(path, s))
++                accept_box.pack_start(button, False, False, 0)
++            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
++            outer.pack_start(text, False, False, 0)
++            outer.pack_start(accept_box, False, False, 0)
++            # A list row has no window of its own, so it never hears the
++            # pointer come and go; an event box does.
++            hover = Gtk.EventBox()
++            hover.add(outer)
++            children = [(hover, True)]
++        row = self._row(children, selectable=selectable, path=path)
++        row.name_label = name_label
++        row.name = name
++        row.accept_box = accept_box
++        if accept_box is not None:
++            hover.connect('enter-notify-event', self._on_row_hover, row, True)
++            hover.connect('leave-notify-event', self._on_row_hover, row, False)
++        return row
++
++    def _on_row_hover(self, widget, event, row, inside):
++        # Moving onto the row's own buttons is a leave with detail
++        # INFERIOR; the pointer is still over the row.
++        if not inside and event.detail == Gdk.NotifyType.INFERIOR:
++            return False
++        selected = self.listbox.get_selected_row() is row
++        row.accept_box.set_visible(inside or selected)
++        return False
++
++    def _update_marks(self):
++        """In the side view: Accept buttons on the selected row only, and a
++        dot on each file that is open and not finished."""
++        selected = self.listbox.get_selected_row()
++        for row in self.listbox.get_children():
++            if row.accept_box is not None:
++                row.accept_box.set_visible(row is selected)
++            if row.name_label is not None:
++                dot = '● ' if self._unfinished(row.path) else ''
++                row.name_label.set_markup(
++                    GLib.markup_escape_text(dot + row.name))
++
++    def _unfinished(self, path) -> bool:
++        # A merge closes once it is saved with nothing unresolved, so every
++        # file still open is unfinished, including one still loading.
++        return path in self.tabs
++
++    def _select(self, path):
++        """Select a file's row without opening it."""
++        self._quiet = True
++        try:
++            for row in self.listbox.get_children():
++                if getattr(row, 'path', None) == path:
++                    self.listbox.select_row(row)
++                    break
++        finally:
++            self._quiet = False
++
++    def _next_mergeable(self, skip=None):
++        """The first unresolved file that has a merge view and is not
++        open, for the side view to show next."""
++        for path in self._unresolved():
++            if path != skip and path not in self.tabs and self._can_merge(path):
++                return path
++        return None
++
++    def _relabel_merges(self):
++        """Tell each open merge which layout it is in, for its save button."""
++        for path, doc in self.tabs.items():
++            has_next = any(p != path for p in self._unresolved())
++            doc.anchored.set_from_list(self._applied, has_next)
++
+     # -- state -----------------------------------------------------------------
+ 
+     def _unresolved(self):
+@@ -250,16 +473,29 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         for child in self.listbox.get_children():
+             self.listbox.remove(child)
+ 
+-        self._row([
+-            (self._label(_dim('File')), True),
+-            (self._label(_dim(self.yours), STATUS_WIDTH + BUTTON_WIDTH + 8), False),
+-            (self._label(_dim(self.theirs), STATUS_WIDTH + BUTTON_WIDTH + 8), False),
+-        ], selectable=False)
++        side = self._side()
++        if side and self.tabs:
++            current = self.window.notebook.get_nth_page(
++                self.window.notebook.get_current_page())
++            selected = next((p for p, d in self.tabs.items() if d is current),
++                            selected)
++        if not side:
++            self._row([
++                (self._label(_dim('File')), True),
++                (self._label(_dim(self.yours), STATUS_WIDTH + BUTTON_WIDTH + 8), False),
++                (self._label(_dim(self.theirs), STATUS_WIDTH + BUTTON_WIDTH + 8), False),
++            ], selectable=False)
+ 
+         unresolved = self._unresolved()
+         self._group('✕', '#f75464', 'Unresolved', len(unresolved))
+         for path in unresolved:
+             stages = self.current[path]
++            if side:
++                deleted = [who for who, st in (('yours', OURS), ('theirs', THEIRS))
++                           if st not in stages]
++                self._side_row(path, note=f'{deleted[0]} deleted' if deleted else None,
++                               accept=True)
++                continue
+             cells = [(self._file_label(path, ''), True)]
+             for stage in (OURS, THEIRS):
+                 cells.append((self._label(side_status(stages, stage), STATUS_WIDTH), False))
+@@ -271,6 +507,9 @@ class ConflictsView(Gtk.Box, MeldDoc):
+             self._group('✨', '#e5c07b', 'Auto-resolved', len(auto),
+                         'open one to check it; Accept and finish stages them')
+             for path in auto:
++                if side:
++                    self._side_row(path, note='merged, not staged yet')
++                    continue
+                 self._row([(self._file_label(path, ''), True),
+                            (self._label(_dim('merged, not staged yet')), False)],
+                           path=path)
+@@ -278,22 +517,34 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         resolved = sorted(p for p in self.initial if p not in self.current)
+         self._group('✓', '#6aab73', 'Resolved', len(resolved))
+         for path in resolved:
++            if side:
++                self._side_row(path, note=self.outcome.get(path, 'resolved'),
++                               selectable=False)
++                continue
+             self._row([(self._file_label(path, ''), True),
+                        (self._label(_dim(self.outcome.get(path, 'resolved'))), False)],
+                       selectable=False)
+ 
+         self.listbox.show_all()
+-        for row in self.listbox.get_children():
+-            if getattr(row, 'path', None) and row.path == selected:
+-                self.listbox.select_row(row)
+-                break
+-        else:
+-            first = next((r for r in self.listbox.get_children()
+-                          if getattr(r, 'path', None)), None)
+-            if first is not None:
+-                self.listbox.select_row(first)
++        self._quiet = True
++        try:
++            for row in self.listbox.get_children():
++                if getattr(row, 'path', None) and row.path == selected:
++                    self.listbox.select_row(row)
++                    break
++            else:
++                first = next((r for r in self.listbox.get_children()
++                              if getattr(r, 'path', None) and r.get_selectable()),
++                             None)
++                if first is not None:
++                    self.listbox.select_row(first)
++        finally:
++            self._quiet = False
+         self._update_simple()
+         self._update_buttons()
++        if side:
++            self._update_marks()
++        self._relabel_merges()
+ 
+     def _update_buttons(self):
+         row = self.listbox.get_selected_row()
+@@ -301,7 +552,8 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         self.merge_button.set_sensitive(bool(path) and self._can_merge(path))
+         self.finish_button.set_sensitive(not self._unresolved())
+         if self._unresolved():
+-            self.hint.set_text('Double-click a file to merge it')
++            self.hint.set_text('Click a file to merge it' if self._side()
++                               else 'Double-click a file to merge it')
+         elif self._pending_auto():
+             self.hint.set_text('Nothing left to resolve; Accept and finish '
+                                'stages the auto-resolved files')
+@@ -365,6 +617,21 @@ class ConflictsView(Gtk.Box, MeldDoc):
+ 
+     # -- actions ---------------------------------------------------------------
+ 
++    def _on_row_selected(self, listbox, row):
++        self._update_buttons()
++        if not self._side():
++            return
++        self._update_marks()
++        path = getattr(row, 'path', None)
++        if self._quiet or path is None:
++            return
++        if self._can_merge(path):
++            self.open_merge(path)
++        else:
++            self._update_stack(
++                f'{os.path.basename(path)} has no merge view: one side '
++                'deleted it or it is binary. Use its Accept buttons.')
++
+     def on_row_activated(self, listbox, row):
+         if getattr(row, 'path', None):
+             self.open_merge(row.path)
+@@ -405,12 +672,16 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         doc = self.window.append_filemerge(
+             files, merge_output=output, anchored=True)
+         doc.set_labels([self.yours, f'Result: {path}', self.theirs])
+-        doc.anchored.set_from_list()
+         doc.close_signal.connect(
+             lambda _doc, status: self.on_merge_closed(path, status))
+         self.tabs[path] = doc
++        self._relabel_merges()
+         self._update_simple()
+         notebook.set_current_page(notebook.page_num(doc))
++        if self._side():
++            self._select(path)
++            self._update_stack()
++            self._update_marks()
+ 
+     def on_merge_closed(self, path, status):
+         """A merge tab closed: status 0 means it was saved with nothing
+@@ -427,6 +698,14 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         if notebook.page_num(self) >= 0:
+             notebook.set_current_page(notebook.page_num(self))
+         self.refresh()
++        if self._side():
++            # Saving opens the next file, but not while the window is
++            # closing its tabs: that would keep it from closing.
++            if not self.window.closing and not notebook.get_n_pages():
++                path = self._next_mergeable(skip=path)
++                if path is not None:
++                    self.open_merge(path)
++            self._update_stack()
+ 
+     def accept(self, path, stage):
+         """Take one side's whole file: its version (or its deletion) is
+diff --git a/meld/meldwindow.py b/meld/meldwindow.py
+index c8fa9d0..da93c26 100644
+--- a/meld/meldwindow.py
++++ b/meld/meldwindow.py
+@@ -24,6 +24,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk
+ import meld.ui.gladesupport  # noqa: F401
+ import meld.ui.util
+ from meld.conf import IS_DEVEL, _
++from meld.conflicts import ask_list_on_close, is_notebook_page
+ from meld.const import (
+     FILE_FILTER_ACTION_FORMAT,
+     TEXT_FILTER_ACTION_FORMAT,
+@@ -52,6 +53,10 @@ class MeldWindow(Gtk.ApplicationWindow):
+     __gtype_name__ = 'MeldWindow'
+ 
+     appvbox = Gtk.Template.Child()
++    # Local patch: the Conflicts list's side view (meld/conflictsview.py).
++    content_stack = Gtk.Template.Child()
++    header_bar = Gtk.Template.Child()
++    side_area = Gtk.Template.Child()
+     folder_filter_button = Gtk.Template.Child()
+     text_filter_button = Gtk.Template.Child()
+     gear_menu_button = Gtk.Template.Child()
+@@ -112,6 +117,11 @@ class MeldWindow(Gtk.ApplicationWindow):
+         self.window_state.bind(self)
+ 
+         self.should_close = False
++        # Local patch: the Conflicts list while it sits in side_area, not in
++        # the notebook, and whether the window is closing (the list must not
++        # open the next file while its tabs are being closed).
++        self.side_doc = None
++        self.closing = False
+         self.idle_hooked = 0
+         self.scheduler = LifoScheduler()
+         self.scheduler.connect("runnable", self.on_scheduler_runnable)
+@@ -213,10 +223,17 @@ class MeldWindow(Gtk.ApplicationWindow):
+     def on_delete_event(self, *extra):
+         # Delete pages from right-to-left.  This ensures that if a version
+         # control page is open in the far left page, it will be closed last.
++        self.closing = True
+         responses = []
+         for page in reversed(self.notebook.get_children()):
+             self.notebook.set_current_page(self.notebook.page_num(page))
+             responses.append(page.on_delete_event())
++        # Local patch: the Conflicts list in the side area is not a tab. It
++        # is asked last, and only once every tab agreed, since its close
++        # ends the application (meld/meldapp.py) with its exit status.
++        if self.side_doc is not None and ask_list_on_close(
++                responses, Gtk.ResponseType.OK):
++            responses.append(self.side_doc.on_delete_event())
+ 
+         have_cancelled_tabs = any(r == Gtk.ResponseType.CANCEL for r in responses)
+         have_saving_tabs = any(r == Gtk.ResponseType.APPLY for r in responses)
+@@ -229,6 +246,8 @@ class MeldWindow(Gtk.ApplicationWindow):
+         # should close once the other tabs have closed (assuming the state)
+         # doesn't otherwise change.
+         self.should_close = have_saving_tabs and not have_cancelled_tabs
++        if have_cancelled_tabs:
++            self.closing = False
+ 
+         return cancel_delete
+ 
+@@ -289,6 +308,10 @@ class MeldWindow(Gtk.ApplicationWindow):
+             self.scheduler.remove_scheduler(page.scheduler)
+ 
+         page_num = self.notebook.page_num(page)
++        # Local patch: the Conflicts list closing from the side area is not
++        # a tab; remove_page(-1) would close the last tab instead.
++        if not is_notebook_page(page_num):
++            return
+ 
+         if self.notebook.get_current_page() == page_num:
+             self.handle_current_doc_switch(page)
+@@ -322,10 +345,17 @@ class MeldWindow(Gtk.ApplicationWindow):
+             # FIXME: Need error handling, but no sensible display location
+             log.exception(f'Error opening recent file {uri}')
+ 
+-    def _append_page(self, page):
++    def add_notebook_page(self, page, position=-1):
++        """Give a document a tab. Local patch: split out of _append_page
++        so the Conflicts list can return to the notebook from the side area
++        without being wired to the window a second time."""
+         nbl = NotebookLabel(page=page)
+-        self.notebook.append_page(page, nbl)
++        self.notebook.insert_page(page, nbl, position)
+         self.notebook.child_set_property(page, 'tab-expand', True)
++        self.notebook.set_tab_reorderable(page, True)
++
++    def _append_page(self, page):
++        self.add_notebook_page(page)
+ 
+         # Change focus to the newly created page only if the user is on a
+         # DirDiff or VcView page, or if it's a new tab page. This prevents
+@@ -344,8 +374,6 @@ class MeldWindow(Gtk.ApplicationWindow):
+             page.tab_state_changed.connect(self.on_page_state_changed)
+         page.close_signal.connect(self.page_removed)
+ 
+-        self.notebook.set_tab_reorderable(page, True)
+-
+     def append_new_comparison(self):
+         doc = NewDiffTab(self)
+         self._append_page(doc)
+@@ -444,6 +472,7 @@ class MeldWindow(Gtk.ApplicationWindow):
+         self._append_page(doc)
+         self.notebook.on_label_changed(doc, doc.label_text, doc.tooltip_text)
+         self.notebook.set_current_page(self.notebook.page_num(doc))
++        doc.start()
+         return doc
+ 
+     def append_vcview(self, location, auto_compare=False):
+diff --git a/meld/resources/ui/appwindow.ui b/meld/resources/ui/appwindow.ui
+index 85c6526..5250112 100644
+--- a/meld/resources/ui/appwindow.ui
++++ b/meld/resources/ui/appwindow.ui
+@@ -249,14 +249,62 @@
+         <property name="orientation">vertical</property>
+         <property name="can_focus">False</property>
+         <child>
+-          <object class="MeldNotebook" id="notebook">
++          <!-- Local patch: a side area for the Conflicts list
++               (meld/conflictsview.py), hidden unless it is in use. It is
++               built here once, so the merge tabs never move. -->
++          <object class="GtkPaned" id="content_paned">
+             <property name="visible">True</property>
+-            <property name="can_focus">True</property>
+-            <property name="scrollable">True</property>
+-            <property name="enable_popup">False</property>
+-            <property name="show_border">False</property>
+-            <signal name="switch-page" handler="on_switch_page" swapped="no"/>
+-            <signal name="switch-page" handler="after_switch_page" after="yes" swapped="no"/>
++            <property name="can_focus">False</property>
++            <property name="orientation">horizontal</property>
++            <property name="position">330</property>
++            <child>
++              <object class="GtkBox" id="side_area">
++                <property name="visible">False</property>
++                <property name="can_focus">False</property>
++                <property name="orientation">vertical</property>
++              </object>
++              <packing>
++                <property name="resize">False</property>
++                <property name="shrink">False</property>
++              </packing>
++            </child>
++            <child>
++              <object class="GtkStack" id="content_stack">
++                <property name="visible">True</property>
++                <property name="can_focus">False</property>
++                <child>
++                  <object class="MeldNotebook" id="notebook">
++                    <property name="visible">True</property>
++                    <property name="can_focus">True</property>
++                    <property name="scrollable">True</property>
++                    <property name="enable_popup">False</property>
++                    <property name="show_border">False</property>
++                    <signal name="switch-page" handler="on_switch_page" swapped="no"/>
++                    <signal name="switch-page" handler="after_switch_page" after="yes" swapped="no"/>
++                  </object>
++                  <packing>
++                    <property name="name">notebook</property>
++                  </packing>
++                </child>
++                <child>
++                  <object class="GtkLabel" id="content_placeholder">
++                    <property name="visible">True</property>
++                    <property name="can_focus">False</property>
++                    <property name="label">Select a file to merge it</property>
++                    <style>
++                      <class name="dim-label"/>
++                    </style>
++                  </object>
++                  <packing>
++                    <property name="name">placeholder</property>
++                  </packing>
++                </child>
++              </object>
++              <packing>
++                <property name="resize">True</property>
++                <property name="shrink">False</property>
++              </packing>
++            </child>
+           </object>
+           <packing>
+             <property name="expand">True</property>
+diff --git a/meld/ui/notebook.py b/meld/ui/notebook.py
+index 3fa2259..46bbb15 100644
+--- a/meld/ui/notebook.py
++++ b/meld/ui/notebook.py
+@@ -164,13 +164,21 @@ class MeldNotebook(Gtk.Notebook):
+         child = self.get_nth_page(page_num)
+         self.reorder_child(child, page_num + 1)
+ 
++    # Local patch: the Conflicts list's side view hides the tab strip, and
++    # it must stay hidden as merge tabs come and go (meld/conflictsview.py).
++    tabs_hidden = False
++
++    def set_tabs_hidden(self, hidden: bool) -> None:
++        self.tabs_hidden = hidden
++        self.props.show_tabs = not hidden and self.get_n_pages() > 1
++
+     def on_page_added(self, notebook, child, page_num, *args):
+         child.connect("label-changed", self.on_label_changed)
+-        self.props.show_tabs = self.get_n_pages() > 1
++        self.props.show_tabs = not self.tabs_hidden and self.get_n_pages() > 1
+ 
+     def on_page_removed(self, notebook, child, page_num, *args):
+         child.disconnect_by_func(self.on_label_changed)
+-        self.props.show_tabs = self.get_n_pages() > 1
++        self.props.show_tabs = not self.tabs_hidden and self.get_n_pages() > 1
+ 
+     def on_label_changed(self, page, text: str, tooltip: str) -> None:
+         nbl = self.get_tab_label(page)
+diff --git a/test/test_conflicts.py b/test/test_conflicts.py
+index 814c125..a7b70be 100644
+--- a/test/test_conflicts.py
++++ b/test/test_conflicts.py
+@@ -11,8 +11,10 @@ import tempfile
+ import unittest
+ 
+ from meld.conflicts import (
++    ask_list_on_close,
+     auto_resolve,
+     is_binary,
++    is_notebook_page,
+     mergeable,
+     parse_unmerged,
+     side_status,
+@@ -116,5 +118,25 @@ class GitTests(unittest.TestCase):
+             self.assertEqual(unmerged(repo), {"f.txt": {1, 2, 3}})
+ 
+ 
++class CloseTests(unittest.TestCase):
++    OK, CANCEL, APPLY = -5, -6, -10
++
++    def test_all_tabs_closing_asks_the_list(self):
++        self.assertTrue(ask_list_on_close([self.OK, self.OK], self.OK))
++
++    def test_no_tabs_asks_the_list(self):
++        self.assertTrue(ask_list_on_close([], self.OK))
++
++    def test_a_cancelled_tab_keeps_the_list(self):
++        self.assertFalse(ask_list_on_close([self.OK, self.CANCEL], self.OK))
++
++    def test_a_saving_tab_keeps_the_list(self):
++        self.assertFalse(ask_list_on_close([self.APPLY], self.OK))
++
++    def test_the_side_list_is_not_a_tab(self):
++        self.assertFalse(is_notebook_page(-1))
++        self.assertTrue(is_notebook_page(0))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

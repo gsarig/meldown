@@ -10,6 +10,7 @@ Stock Meld opens a three-way merge with the result already half-merged, and ever
 
 - **Merge view (`--anchored-merge`).** The result starts as the common base. Every change from either side gets an arrow to apply it and an X to dismiss it; on a conflict, a second arrow adds the other side after the first. A toolbar applies all non-conflicting changes from the left, the right or both, runs the magic wand on simple conflicts, and counts changes, unresolved changes and conflicts. The side panes are read-only, applied lines are tinted, dismissed ones struck through. Undo, typing and reopening a half-done file all keep each change's state, because the state is worked out from the text itself.
 - **Conflicts tab (`--conflicts DIR`).** Every conflicted file of a git repository in one list, grouped Unresolved, Auto-resolved and Resolved, with an Accept button per side, Resolve simple conflicts (which says how many files it would merge, and is greyed out when there are none), and Accept and finish. Double-click a file to open it in the merge view.
+- **Side panel.** The same list can sit beside the file being merged instead of in its own tab: click a file to show its merge, and saving opens the next one. A switch in the header bar flips between the two layouts at any time, open files included.
 - **Calmer highlighting.** Changes are marked word by word, not character by character, and whitespace is ignored, so a re-indented block no longer lights up.
 - **Conflict count** in the merge pane's status bar.
 - **Branch names as pane titles**, from the wrapper, for merges, rebases and cherry-picks.
@@ -97,6 +98,11 @@ The quiet colour for changes you have already handled is `meld:resolved` in the 
 
 - `git mergetool` opens each conflicted file in the merge view, one after another. Save and close moves on to the next file.
 - `meldown-merge.sh --repo`, run inside a repository with conflicts, opens the Conflicts tab. An alias makes it handy: `alias mergeall='~/src/meldown/meldown-merge.sh --repo'`.
+- The "◧ Side panel | ▭ Tabs" switch at the left of the header bar moves the list between its own tab and a side panel. To start in the side panel, change the setting once (the switch itself changes only the open window):
+
+```bash
+GSETTINGS_SCHEMA_DIR=$HOME/.local/src/meld/data gsettings set org.gnome.meld conflicts-layout 'side'
+```
 
 To try both on a throwaway repo:
 

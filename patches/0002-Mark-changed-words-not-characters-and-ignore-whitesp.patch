@@ -1,7 +1,7 @@
 From 8fdaa7ff623e79b2470f2fa71c41fffc8d1c7a8a Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Wed, 11 Nov 2026 20:09:04 +0200
-Subject: [PATCH 2/6] Mark changed words, not characters, and ignore whitespace
+Subject: [PATCH 2/7] Mark changed words, not characters, and ignore whitespace
 
 Inline highlighting compared character by character and drew whitespace
 inside highlights, so a re-indented block marked every added space and

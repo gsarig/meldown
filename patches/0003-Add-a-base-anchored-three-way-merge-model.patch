@@ -1,7 +1,7 @@
 From 7f0ee8f07cd70a795cea69f2bb5087f1a8b159d0 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Wed, 11 Nov 2026 20:29:03 +0200
-Subject: [PATCH 3/6] Add a base-anchored three-way merge model
+Subject: [PATCH 3/7] Add a base-anchored three-way merge model
 
 Stock Meld diffs the result against each side and recomputes after every
 edit, so an applied change just stops being a difference and a dismissed
