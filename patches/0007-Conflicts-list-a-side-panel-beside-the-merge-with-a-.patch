@@ -1,7 +1,7 @@
 From 61817dff6a2dc6f306db8d6bb3a72efbec6d140c Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 20:33:25 +0200
-Subject: [PATCH 7/7] Conflicts list: a side panel beside the merge, with a
+Subject: [PATCH 7/8] Conflicts list: a side panel beside the merge, with a
  layout switch
 
 The Conflicts list can sit in a side panel next to the file being merged,

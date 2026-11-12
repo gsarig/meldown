@@ -1,7 +1,7 @@
 From b863a3ac20dee478d06abe43fb624b5c77268608 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 15:50:31 +0200
-Subject: [PATCH 6/7] Conflicts tab: say how many files Resolve simple
+Subject: [PATCH 6/8] Conflicts tab: say how many files Resolve simple
  conflicts would merge, grey out empty groups
 
 The button now reads 'Resolve simple conflicts (N files)' and is greyed out

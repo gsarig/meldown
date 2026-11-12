@@ -1,7 +1,7 @@
 From 783b397d81730e72da60e4cda3277db618a6aea4 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 01:24:56 +0200
-Subject: [PATCH 5/7] Add the Conflicts tab (--conflicts DIR)
+Subject: [PATCH 5/8] Add the Conflicts tab (--conflicts DIR)
 
 A Conflicts tab for Meld: every conflicted file of a git
 repository, grouped Unresolved, Auto-resolved and Resolved, with Yours

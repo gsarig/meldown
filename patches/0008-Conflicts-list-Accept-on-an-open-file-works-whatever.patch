@@ -1,0 +1,74 @@
+From 8b99dc0a2a2503b35ea734fd83e1eea3c6876fc6 Mon Sep 17 00:00:00 2001
+From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
+Date: Thu, 12 Nov 2026 20:53:57 +0200
+Subject: [PATCH 8/8] Conflicts list: Accept on an open file works whatever the
+ save prompt says
+
+Accepting a side for a file open in a merge first closed the merge
+through Meld's "save changes?" prompt. Choosing Save there started an
+asynchronous save, which Accept read as "not closed" and quietly gave up,
+so nothing happened. Saving a merge that Accept is about to replace is
+pointless anyway: the merge now closes without that prompt, and once
+changes have been applied or dismissed in it, one question asks whether
+to drop that work (Keep merging / Take it).
+
+In the side view, the placeholder also updates after an Accept, so it
+says when nothing is left to resolve.
+---
+ meld/conflictsview.py | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/meld/conflictsview.py b/meld/conflictsview.py
+index dbe7509..35101d1 100644
+--- a/meld/conflictsview.py
++++ b/meld/conflictsview.py
+@@ -701,9 +701,10 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         """Take one side's whole file: its version (or its deletion) is
+         staged, with no merge view."""
+         stages = self.current.get(path, set())
++        who = self.yours if stage == OURS else self.theirs
+         tab = self.tabs.get(path)
+         if tab is not None and self.window.notebook.page_num(tab) >= 0:
+-            if tab.on_delete_event() != Gtk.ResponseType.OK:
++            if not self._discard_merge(tab, path, who):
+                 return
+         side = '--ours' if stage == OURS else '--theirs'
+         try:
+@@ -715,10 +716,33 @@ class ConflictsView(Gtk.Box, MeldDoc):
+         except (OSError, subprocess.CalledProcessError) as err:
+             self._error(f'Could not accept {path}', err)
+             return
+-        who = self.yours if stage == OURS else self.theirs
+         self.outcome[path] = f'took {who}'
+         self.auto.discard(path)
+         self.refresh()
++        self._update_stack()
++
++    def _discard_merge(self, tab, path, who) -> bool:
++        """Close a file's open merge so Accept can replace the file. Not
++        through Meld's "save changes?" prompt: saving a merge the next step
++        overwrites is pointless, and choosing Save there starts an
++        asynchronous save that left Accept doing nothing. Once changes have
++        been applied or dismissed in it, ask once whether to drop that work.
++        """
++        model = getattr(tab.anchored, 'model', None)
++        if model is not None:
++            changes, unresolved, _conflicts = model.counts()
++            if unresolved < changes:
++                response = misc.modal_dialog(
++                    f'Take {who} for {os.path.basename(path)}?',
++                    'The merge you started for this file is discarded.',
++                    (('_Keep merging', Gtk.ResponseType.CANCEL, None),
++                     ('_Take it', Gtk.ResponseType.OK, 'destructive-action')),
++                    parent=self.window, messagetype=Gtk.MessageType.QUESTION)
++                if response != Gtk.ResponseType.OK:
++                    return False
++        for buf in tab.textbuffer:
++            buf.set_modified(False)
++        return tab.on_delete_event() == Gtk.ResponseType.OK
+ 
+     def resolve_simple(self):
+         """Merge every unresolved file that has no real conflict, word by
+-- 
+2.43.0
+

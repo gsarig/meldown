@@ -1,7 +1,7 @@
 From 06345008bf5ccebbdb7b498c8e539b0e58c8e98c Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 00:42:00 +0200
-Subject: [PATCH 4/7] Add an apply-or-dismiss merge view (--anchored-merge)
+Subject: [PATCH 4/8] Add an apply-or-dismiss merge view (--anchored-merge)
 
 A three-way merge opened with --anchored-merge starts the result from the
 base and puts an arrow and an X on every change: the arrow applies that
