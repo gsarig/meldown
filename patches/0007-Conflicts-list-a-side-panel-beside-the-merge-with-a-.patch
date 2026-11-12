@@ -1,4 +1,4 @@
-From a25b2b8a1eb0f167be82a517bb45da3b72610cfc Mon Sep 17 00:00:00 2001
+From ee2f29e53b109922b415a847e43d6e81ee68cb39 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 20:33:25 +0200
 Subject: [PATCH 7/7] Conflicts list: a side panel beside the merge, with a
@@ -6,8 +6,9 @@ Subject: [PATCH 7/7] Conflicts list: a side panel beside the merge, with a
 
 The Conflicts list can sit in a side panel next to the file being merged,
 as well as in a tab of its own. A switch in the header bar flips between
-the two at any time; the conflicts-layout setting picks the starting one
-(tabs by default). Only the list moves: the merge tabs stay notebook pages
+the two at any time and saves the choice in the conflicts-layout setting,
+so the list opens in the layout used last (tabs at first). Only the list
+moves: the merge tabs stay notebook pages
 in both layouts, with their tab strip hidden in the side view, since a
 merge view moved to another container re-runs one-time setup in its
 widgets.
@@ -22,15 +23,15 @@ status; both decisions are pure functions tested in test_conflicts.
  data/org.gnome.Meld.gschema.xml |   9 +
  meld/anchoredview.py            |  34 +++-
  meld/conflicts.py               |  18 ++
- meld/conflictsview.py           | 315 ++++++++++++++++++++++++++++++--
+ meld/conflictsview.py           | 320 ++++++++++++++++++++++++++++++--
  meld/meldwindow.py              |  37 +++-
  meld/resources/ui/appwindow.ui  |  62 ++++++-
  meld/ui/notebook.py             |  12 +-
  test/test_conflicts.py          |  22 +++
- 8 files changed, 470 insertions(+), 39 deletions(-)
+ 8 files changed, 475 insertions(+), 39 deletions(-)
 
 diff --git a/data/org.gnome.Meld.gschema.xml b/data/org.gnome.Meld.gschema.xml
-index d503a0c..2fd79a6 100644
+index d503a0c..d199568 100644
 --- a/data/org.gnome.Meld.gschema.xml
 +++ b/data/org.gnome.Meld.gschema.xml
 @@ -84,6 +84,15 @@
@@ -44,7 +45,7 @@ index d503a0c..2fd79a6 100644
 +          </choices>
 +          <default>"tabs"</default>
 +          <summary>Where the Conflicts list opens (local patch)</summary>
-+          <description>"tabs" opens the list of conflicted files in a tab of its own, each file in another tab; "side" keeps the list in a side panel beside the file being merged. The switch in the header bar changes only the open window.</description>
++          <description>"tabs" opens the list of conflicted files in a tab of its own, each file in another tab; "side" keeps the list in a side panel beside the file being merged. The switch in the header bar sets it, so the list opens in the layout used last.</description>
 +      </key>
        <key name="style-scheme" type="s">
            <default>"classic"</default>
@@ -142,15 +143,15 @@ index 993fd78..f6a5384 100644
 +    would read as "the last tab"."""
 +    return page_num >= 0
 diff --git a/meld/conflictsview.py b/meld/conflictsview.py
-index d0abac5..b75d534 100644
+index d0abac5..629d959 100644
 --- a/meld/conflictsview.py
 +++ b/meld/conflictsview.py
 @@ -22,6 +22,13 @@ finish. A file opens in the anchored merge view (meld/anchoredview.py) in
  a tab of its own; saving it with nothing unresolved stages it and brings
  the list back.
  
-+The list has two layouts, switched from the header bar and started from
-+the conflicts-layout setting: "tabs", the list as a tab of its own, and
++The list has two layouts, switched from the header bar, which also saves
++the choice in the conflicts-layout setting, the one the list starts in: "tabs", the list as a tab of its own, and
 +"side", the list in the window's side area (meld/meldwindow.py) beside the
 +merge tabs, whose tab strip is then hidden. Only the list moves between
 +them: the merge tabs stay notebook pages either way, since a merge view
@@ -188,7 +189,7 @@ index d0abac5..b75d534 100644
  
          self._build()
          self.show_all()
-@@ -119,9 +132,130 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -119,9 +132,135 @@ class ConflictsView(Gtk.Box, MeldDoc):
  
      def on_delete_event(self):
          self.scheduler.remove_all_tasks()
@@ -237,6 +238,11 @@ index d0abac5..b75d534 100644
 +    def _on_toggled(self, button, layout):
 +        if button.get_active():
 +            self.set_layout(layout)
++            # Remembered, so the next Conflicts list starts in the layout
++            # used last.
++            settings = get_settings()
++            if settings.get_string('conflicts-layout') != layout:
++                settings.set_string('conflicts-layout', layout)
 +
 +    def set_layout(self, layout: str):
 +        """Move the list between its own tab and the side area. The merge
@@ -319,7 +325,7 @@ index d0abac5..b75d534 100644
      def exit_status(self) -> int:
          if self.finished:
              return 0
-@@ -152,7 +286,7 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -152,7 +291,7 @@ class ConflictsView(Gtk.Box, MeldDoc):
          self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
          self.listbox.set_activate_on_single_click(False)
          self.listbox.connect('row-activated', self.on_row_activated)
@@ -328,7 +334,7 @@ index d0abac5..b75d534 100644
          scroller = Gtk.ScrolledWindow()
          scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
          scroller.add(self.listbox)
-@@ -189,6 +323,8 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -189,6 +328,8 @@ class ConflictsView(Gtk.Box, MeldDoc):
          row.set_selectable(selectable)
          row.set_activatable(selectable)
          row.path = path
@@ -337,7 +343,7 @@ index d0abac5..b75d534 100644
          box = Gtk.Box(spacing=8)
          box.props.margin = 6
          for widget, expand in children:
-@@ -231,6 +367,93 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -231,6 +372,93 @@ class ConflictsView(Gtk.Box, MeldDoc):
              text += '  ' + _dim(folder)
          return self._label(text)
  
@@ -431,7 +437,7 @@ index d0abac5..b75d534 100644
      # -- state -----------------------------------------------------------------
  
      def _unresolved(self):
-@@ -250,16 +473,29 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -250,16 +478,29 @@ class ConflictsView(Gtk.Box, MeldDoc):
          for child in self.listbox.get_children():
              self.listbox.remove(child)
  
@@ -466,7 +472,7 @@ index d0abac5..b75d534 100644
              cells = [(self._file_label(path, ''), True)]
              for stage in (OURS, THEIRS):
                  cells.append((self._label(side_status(stages, stage), STATUS_WIDTH), False))
-@@ -271,6 +507,9 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -271,6 +512,9 @@ class ConflictsView(Gtk.Box, MeldDoc):
              self._group('✨', '#e5c07b', 'Auto-resolved', len(auto),
                          'open one to check it; Accept and finish stages them')
              for path in auto:
@@ -476,7 +482,7 @@ index d0abac5..b75d534 100644
                  self._row([(self._file_label(path, ''), True),
                             (self._label(_dim('merged, not staged yet')), False)],
                            path=path)
-@@ -278,22 +517,34 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -278,22 +522,34 @@ class ConflictsView(Gtk.Box, MeldDoc):
          resolved = sorted(p for p in self.initial if p not in self.current)
          self._group('✓', '#6aab73', 'Resolved', len(resolved))
          for path in resolved:
@@ -520,7 +526,7 @@ index d0abac5..b75d534 100644
  
      def _update_buttons(self):
          row = self.listbox.get_selected_row()
-@@ -301,7 +552,8 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -301,7 +557,8 @@ class ConflictsView(Gtk.Box, MeldDoc):
          self.merge_button.set_sensitive(bool(path) and self._can_merge(path))
          self.finish_button.set_sensitive(not self._unresolved())
          if self._unresolved():
@@ -530,7 +536,7 @@ index d0abac5..b75d534 100644
          elif self._pending_auto():
              self.hint.set_text('Nothing left to resolve; Accept and finish '
                                 'stages the auto-resolved files')
-@@ -365,6 +617,21 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -365,6 +622,21 @@ class ConflictsView(Gtk.Box, MeldDoc):
  
      # -- actions ---------------------------------------------------------------
  
@@ -552,7 +558,7 @@ index d0abac5..b75d534 100644
      def on_row_activated(self, listbox, row):
          if getattr(row, 'path', None):
              self.open_merge(row.path)
-@@ -405,12 +672,16 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -405,12 +677,16 @@ class ConflictsView(Gtk.Box, MeldDoc):
          doc = self.window.append_filemerge(
              files, merge_output=output, anchored=True)
          doc.set_labels([self.yours, f'Result: {path}', self.theirs])
@@ -570,7 +576,7 @@ index d0abac5..b75d534 100644
  
      def on_merge_closed(self, path, status):
          """A merge tab closed: status 0 means it was saved with nothing
-@@ -427,6 +698,14 @@ class ConflictsView(Gtk.Box, MeldDoc):
+@@ -427,6 +703,14 @@ class ConflictsView(Gtk.Box, MeldDoc):
          if notebook.page_num(self) >= 0:
              notebook.set_current_page(notebook.page_num(self))
          self.refresh()

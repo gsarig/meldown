@@ -98,7 +98,7 @@ The quiet colour for changes you have already handled is `meld:resolved` in the 
 
 - `git mergetool` opens each conflicted file in the merge view, one after another. Save and close moves on to the next file.
 - `meldown-merge.sh --repo`, run inside a repository with conflicts, opens the Conflicts tab. An alias makes it handy: `alias mergeall='~/src/meldown/meldown-merge.sh --repo'`.
-- The "◧ Side panel | ▭ Tabs" switch at the left of the header bar moves the list between its own tab and a side panel. To start in the side panel, change the setting once (the switch itself changes only the open window):
+- The "◧ Side panel | ▭ Tabs" switch at the left of the header bar moves the list between its own tab and a side panel, and Meld remembers it: the list opens in the layout you used last (Tabs at first). It is the `conflicts-layout` setting, so it can also be set without opening Meld:
 
 ```bash
 GSETTINGS_SCHEMA_DIR=$HOME/.local/src/meld/data gsettings set org.gnome.meld conflicts-layout 'side'
