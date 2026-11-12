@@ -7,16 +7,16 @@ Patches that give [Meld](https://meld.app/) a calmer way to resolve merge confli
 Stock Meld opens a three-way merge with the result already half-merged, and every change shows as a copy between panes. meldown keeps Meld and changes how a merge works:
 
 - ✅ **Apply or dismiss each change.** The result starts from the common base, and every change gets an arrow to apply it and an X to dismiss it. On a conflict, take one side, or both one after the other.
-- ✅ **Progress that sticks.** Undo, typing and reopening a half-done file keep each change's state, because it is worked out from the text itself.
+- ✅ **Applied and dismissed changes stay marked** through undo, typing and reopening a half-done file, because their state is worked out from the text itself.
 - ✅ **A one-click toolbar.** Apply every non-conflicting change from the left, the right or both, and let the word-level magic wand merge conflicts that don't overlap.
 - ✅ **Every conflicted file in one list,** grouped Unresolved, Auto-resolved and Resolved, with Accept yours and Accept theirs per file, and Accept and finish.
 - ✅ **A side panel or tabs.** Keep the list beside the file you are merging, or in a tab of its own. Switch at any time, open files included, and Meld remembers your choice.
 - ✅ **Save and next file.** In the side panel, saving moves straight on to the next unresolved file.
 - ✅ **Resolve simple conflicts across files,** with a count of how many files it would merge.
 - ✅ **Calmer highlighting.** Changes are marked word by word, and whitespace-only changes are ignored.
-- ✅ **Counts you can see.** Conflicts left in the status bar, changes and unresolved ones in the toolbar, and a dot on every open, unfinished file.
+- ✅ **Counters for what is left:** conflicts in the status bar, changes and unresolved changes in the toolbar, and a dot on every open, unfinished file.
 - ✅ **Branch names as pane titles** for merges, rebases and cherry-picks.
-- ✅ **An exit code git can trust.** With `trustExitCode`, a half-done file is never marked as resolved.
+- ✅ **A correct exit status for `git mergetool`.** Meld exits 0 only when the result was saved with nothing unresolved, so with `trustExitCode` git never marks a half-done file as resolved.
 
 ![meldown demo: the side panel, the same list as tabs, then resolving both files in the side panel](.github/assets/meldown.gif)
 
