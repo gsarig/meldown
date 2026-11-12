@@ -2,6 +2,10 @@
 
 Patches that give [Meld](https://meld.app/) a calmer way to resolve merge conflicts, where you apply or dismiss each change and see every conflicted file in one list, plus a `git mergetool` wrapper and a dark theme to match.
 
+![meldown demo: the Conflicts tab and the merge view](.github/assets/meldown.gif)
+
+*[Watch the full-quality video](.github/assets/meldown.mp4).*
+
 Stock Meld opens a three-way merge with the result already half-merged, and every change shows as a copy between panes. meldown keeps Meld but changes how a merge works:
 
 - **Merge view (`--anchored-merge`).** The result starts as the common base. Every change from either side gets an arrow to apply it and an X to dismiss it; on a conflict, a second arrow adds the other side after the first. A toolbar applies all non-conflicting changes from the left, the right or both, runs the magic wand on simple conflicts, and counts changes, unresolved changes and conflicts. The side panes are read-only, applied lines are tinted, dismissed ones struck through. Undo, typing and reopening a half-done file all keep each change's state, because the state is worked out from the text itself.

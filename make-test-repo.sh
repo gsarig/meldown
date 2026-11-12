@@ -53,13 +53,37 @@ export function BannerSplit({ banner, className = '' }: BannerProps) {
 }
 EOF
 cat > src/Banner.tsx <<'EOF'
+import { cn } from '@/lib/utils';
+
+export type BannerTone = 'light' | 'dark';
+
 export type BannerProps = {
   banner: {
     heading: string;
     intro?: string;
   };
+  tone?: BannerTone;
   className?: string;
 };
+
+// Classes for the outer section, by tone.
+export function bannerClasses(tone: BannerTone = 'dark', className = '') {
+  return cn(
+    'relative overflow-hidden',
+    'transition-colors',
+    tone === 'dark' ? 'bg-green-900 text-white' : 'bg-white text-green-900',
+    className,
+  );
+}
+
+// The heading level used when none is given.
+export const DEFAULT_LEVEL = 1;
+
+// Trims the intro and drops it when empty.
+export function cleanIntro(intro?: string) {
+  const text = intro?.trim();
+  return text ? text : undefined;
+}
 EOF
 git add -A
 git commit -qm "Banner: base"
@@ -96,14 +120,38 @@ export function BannerSplit({ banner, className = '' }: BannerProps) {
 }
 EOF
 cat > "$T/Banner.tsx" <<'EOF'
+import { cn } from '@/lib/utils';
+
+export type BannerTone = 'light' | 'dark';
+
 export type BannerProps = {
   banner: {
     heading: string;
     intro?: string;
     image?: { url: string; alt: string };
   };
+  tone?: BannerTone;
   className?: string;
 };
+
+// Classes for the outer section, by tone.
+export function bannerClasses(tone: BannerTone = 'dark', className = '') {
+  return cn(
+    'relative overflow-hidden',
+    'transition-colors',
+    tone === 'dark' ? 'bg-green-900 text-white' : 'bg-stone-50 text-green-900',
+    className,
+  );
+}
+
+// The heading level used when none is given.
+export const DEFAULT_LEVEL = 1;
+
+// Trims the intro and drops it when empty.
+export function cleanIntro(intro?: string) {
+  const text = intro?.trim();
+  return text || undefined;
+}
 EOF
 export GIT_INDEX_FILE=.git/theirs-index
 git read-tree "$base"
@@ -150,14 +198,38 @@ export function BannerSplit({ banner, className = '' }: BannerProps) {
 }
 EOF
 cat > src/Banner.tsx <<'EOF'
+import { cn } from '@/lib/utils';
+
+export type BannerTone = 'light' | 'dark';
+
 export type BannerProps = {
   banner: {
     heading: string;
     intro?: string;
     cards?: { heading?: string }[];
   };
+  tone?: BannerTone;
   className?: string;
 };
+
+// Classes for the outer section, by tone.
+export function bannerClasses(tone: BannerTone = 'dark', className = '') {
+  return cn(
+    'relative isolate overflow-hidden',
+    'transition-colors',
+    tone === 'dark' ? 'bg-green-900 text-white' : 'bg-white text-green-900',
+    className,
+  );
+}
+
+// The heading level used when none is given.
+export const DEFAULT_LEVEL = 2;
+
+// Trims the intro and drops it when empty.
+export function cleanIntro(intro?: string) {
+  const text = intro?.trim();
+  return text ? text : undefined;
+}
 EOF
 git commit -qam "Banner: feature cards"
 
