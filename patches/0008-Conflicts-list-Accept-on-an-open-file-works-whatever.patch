@@ -1,7 +1,7 @@
 From 8b99dc0a2a2503b35ea734fd83e1eea3c6876fc6 Mon Sep 17 00:00:00 2001
 From: Giorgos Sarigiannidis <contact@gsarigiannidis.gr>
 Date: Thu, 12 Nov 2026 20:53:57 +0200
-Subject: [PATCH 8/8] Conflicts list: Accept on an open file works whatever the
+Subject: [PATCH 8/9] Conflicts list: Accept on an open file works whatever the
  save prompt says
 
 Accepting a side for a file open in a merge first closed the merge
